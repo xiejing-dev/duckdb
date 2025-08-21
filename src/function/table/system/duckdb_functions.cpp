@@ -41,6 +41,9 @@ static unique_ptr<FunctionData> DuckDBFunctionsBind(ClientContext &context, Tabl
 	names.emplace_back("function_name");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
+	names.emplace_back("alias_of");
+	return_types.emplace_back(LogicalType::VARCHAR);
+
 	names.emplace_back("function_type");
 	return_types.emplace_back(LogicalType::VARCHAR);
 
@@ -82,6 +85,9 @@ static unique_ptr<FunctionData> DuckDBFunctionsBind(ClientContext &context, Tabl
 
 	names.emplace_back("stability");
 	return_types.emplace_back(LogicalType::VARCHAR);
+
+	names.emplace_back("categories");
+	return_types.emplace_back(LogicalType::LIST(LogicalType::VARCHAR));
 
 	return nullptr;
 }
@@ -248,7 +254,7 @@ struct MacroExtractor {
 		vector<Value> results;
 		auto &macro_entry = *entry.macros[offset];
 		for (auto &param : macro_entry.parameters) {
-			D_ASSERT(param->type == ExpressionType::COLUMN_REF);
+			D_ASSERT(param->GetExpressionType() == ExpressionType::COLUMN_REF);
 			auto &colref = param->Cast<ColumnRefExpression>();
 			results.emplace_back(colref.GetColumnName());
 		}
@@ -319,7 +325,7 @@ struct TableMacroExtractor {
 		vector<Value> results;
 		auto &macro_entry = *entry.macros[offset];
 		for (auto &param : macro_entry.parameters) {
-			D_ASSERT(param->type == ExpressionType::COLUMN_REF);
+			D_ASSERT(param->GetExpressionType() == ExpressionType::COLUMN_REF);
 			auto &colref = param->Cast<ColumnRefExpression>();
 			results.emplace_back(colref.GetColumnName());
 		}
@@ -598,6 +604,11 @@ bool ExtractFunctionData(FunctionEntry &entry, idx_t function_idx, DataChunk &ou
 	// function_name, LogicalType::VARCHAR
 	output.SetValue(col++, output_offset, Value(function.name));
 
+	// alias_of, LogicalType::VARCHAR
+	output.SetValue(col++, output_offset,
+	                function.alias_of.empty() || function.alias_of == function.name ? Value()
+	                                                                                : Value(function.alias_of));
+
 	// function_type, LogicalType::VARCHAR
 	output.SetValue(col++, output_offset, Value(OP::GetFunctionType()));
 
@@ -642,6 +653,10 @@ bool ExtractFunctionData(FunctionEntry &entry, idx_t function_idx, DataChunk &ou
 
 	// stability, LogicalType::VARCHAR
 	output.SetValue(col++, output_offset, OP::ResultType(function, function_idx));
+
+	// categories, LogicalType::LIST(LogicalType::VARCHAR)
+	output.SetValue(col++, output_offset,
+	                Value::LIST(LogicalType::VARCHAR, ToValueVector(function_description.categories)));
 
 	return function_idx + 1 == OP::FunctionCount(function);
 }

@@ -14,7 +14,10 @@
 
 namespace duckdb {
 
-bool TopN::CanOptimize(LogicalOperator &op) {
+TopN::TopN(ClientContext &context_p) : context(context_p) {
+}
+
+bool TopN::CanOptimize(LogicalOperator &op, optional_ptr<ClientContext> context) {
 	if (op.type == LogicalOperatorType::LOGICAL_LIMIT) {
 		auto &limit = op.Cast<LogicalLimit>();
 
@@ -28,6 +31,22 @@ bool TopN::CanOptimize(LogicalOperator &op) {
 		}
 
 		auto child_op = op.children[0].get();
+		if (context) {
+			// estimate child cardinality if the context is available
+			child_op->EstimateCardinality(*context);
+		}
+
+		if (child_op->has_estimated_cardinality) {
+			// only check if we should switch to full sorting if we have estimated cardinality
+			auto constant_limit = static_cast<double>(limit.limit_val.GetConstantValue());
+			auto child_card = static_cast<double>(child_op->estimated_cardinality);
+
+			// if the limit is > 0.7% of the child cardinality, sorting the whole table is faster
+			bool limit_is_large = constant_limit > 5000;
+			if (constant_limit > child_card * 0.007 && limit_is_large) {
+				return false;
+			}
+		}
 
 		while (child_op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			D_ASSERT(!child_op->children.empty());
@@ -47,12 +66,16 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 		return;
 	}
 	auto &type = op.orders[0].expression->return_type;
-	if (!TypeIsIntegral(type.InternalType())) {
+	if (!TypeIsIntegral(type.InternalType()) && type.id() != LogicalTypeId::VARCHAR) {
 		// only supported for integral types currently
 		return;
 	}
-	if (op.orders[0].expression->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (op.orders[0].expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		// we can only pushdown on ORDER BY [col] currently
+		return;
+	}
+	if (op.dynamic_filter) {
+		// dynamic filter is already set
 		return;
 	}
 	auto &colref = op.orders[0].expression->Cast<BoundColumnRefExpression>();
@@ -79,7 +102,8 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 		comparison_type =
 		    op.orders.size() == 1 ? ExpressionType::COMPARE_GREATERTHAN : ExpressionType::COMPARE_GREATERTHANOREQUALTO;
 	}
-	auto base_filter = make_uniq<ConstantFilter>(comparison_type, Value::MinimumValue(type));
+	Value minimum_value = type.InternalType() == PhysicalType::VARCHAR ? Value("") : Value::MinimumValue(type);
+	auto base_filter = make_uniq<ConstantFilter>(comparison_type, std::move(minimum_value));
 	auto filter_data = make_shared_ptr<DynamicFilterData>();
 	filter_data->filter = std::move(base_filter);
 
@@ -102,7 +126,7 @@ void TopN::PushdownDynamicFilters(LogicalTopN &op) {
 }
 
 unique_ptr<LogicalOperator> TopN::Optimize(unique_ptr<LogicalOperator> op) {
-	if (CanOptimize(*op)) {
+	if (CanOptimize(*op, &context)) {
 
 		vector<unique_ptr<LogicalOperator>> projections;
 
@@ -135,7 +159,6 @@ unique_ptr<LogicalOperator> TopN::Optimize(unique_ptr<LogicalOperator> op) {
 		if (topn->children[0]->has_estimated_cardinality && topn->children[0]->estimated_cardinality < limit_val) {
 			cardinality = topn->children[0]->estimated_cardinality;
 		}
-		PushdownDynamicFilters(*topn);
 		topn->SetEstimatedCardinality(cardinality);
 		op = std::move(topn);
 
@@ -146,6 +169,9 @@ unique_ptr<LogicalOperator> TopN::Optimize(unique_ptr<LogicalOperator> op) {
 			op = std::move(node);
 			projections.pop_back();
 		}
+	}
+	if (op->type == LogicalOperatorType::LOGICAL_TOP_N) {
+		PushdownDynamicFilters(op->Cast<LogicalTopN>());
 	}
 
 	for (auto &child : op->children) {

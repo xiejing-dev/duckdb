@@ -11,7 +11,6 @@
 #include "duckdb/storage/object_cache.hpp"
 #include "duckdb/common/types/hash.hpp"
 #include "duckdb/execution/operator/csv_scanner/state_machine_options.hpp"
-#include "duckdb/execution/operator/csv_scanner/quote_rules.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_state.hpp"
 
 namespace duckdb {
@@ -19,7 +18,7 @@ namespace duckdb {
 //! Class to wrap the state machine matrix
 class StateMachine {
 public:
-	static constexpr uint32_t NUM_STATES = 18;
+	static constexpr uint32_t NUM_STATES = 19;
 	static constexpr uint32_t NUM_TRANSITIONS = 256;
 	CSVState state_machine[NUM_TRANSITIONS][NUM_STATES];
 	//! Transitions where we might skip processing

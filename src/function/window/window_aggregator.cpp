@@ -12,18 +12,17 @@ namespace duckdb {
 WindowAggregatorState::WindowAggregatorState() : allocator(Allocator::DefaultAllocator()) {
 }
 
-WindowAggregator::WindowAggregator(const BoundWindowExpression &wexpr, const WindowExcludeMode exclude_mode_p)
+WindowAggregator::WindowAggregator(const BoundWindowExpression &wexpr)
     : wexpr(wexpr), aggr(wexpr), result_type(wexpr.return_type), state_size(aggr.function.state_size(aggr.function)),
-      exclude_mode(exclude_mode_p) {
+      exclude_mode(wexpr.exclude_clause) {
 
 	for (auto &child : wexpr.children) {
 		arg_types.emplace_back(child->return_type);
 	}
 }
 
-WindowAggregator::WindowAggregator(const BoundWindowExpression &wexpr, const WindowExcludeMode exclude_mode_p,
-                                   WindowSharedExpressions &shared)
-    : WindowAggregator(wexpr, exclude_mode_p) {
+WindowAggregator::WindowAggregator(const BoundWindowExpression &wexpr, WindowSharedExpressions &shared)
+    : WindowAggregator(wexpr) {
 	for (auto &child : wexpr.children) {
 		child_idx.emplace_back(shared.RegisterCollection(child, false));
 	}
@@ -37,16 +36,16 @@ unique_ptr<WindowAggregatorState> WindowAggregator::GetGlobalState(ClientContext
 	return make_uniq<WindowAggregatorGlobalState>(context, *this, group_count);
 }
 
-void WindowAggregatorLocalState::Sink(WindowAggregatorGlobalState &gastate, DataChunk &sink_chunk,
-                                      DataChunk &coll_chunk, idx_t input_idx) {
+void WindowAggregatorLocalState::Sink(ExecutionContext &context, WindowAggregatorGlobalState &gastate,
+                                      DataChunk &sink_chunk, DataChunk &coll_chunk, idx_t input_idx) {
 }
 
-void WindowAggregator::Sink(WindowAggregatorState &gstate, WindowAggregatorState &lstate, DataChunk &sink_chunk,
-                            DataChunk &coll_chunk, idx_t input_idx, optional_ptr<SelectionVector> filter_sel,
-                            idx_t filtered) {
+void WindowAggregator::Sink(ExecutionContext &context, WindowAggregatorState &gstate, WindowAggregatorState &lstate,
+                            DataChunk &sink_chunk, DataChunk &coll_chunk, idx_t input_idx,
+                            optional_ptr<SelectionVector> filter_sel, idx_t filtered, InterruptState &interrupt) {
 	auto &gastate = gstate.Cast<WindowAggregatorGlobalState>();
 	auto &lastate = lstate.Cast<WindowAggregatorLocalState>();
-	lastate.Sink(gastate, sink_chunk, coll_chunk, input_idx);
+	lastate.Sink(context, gastate, sink_chunk, coll_chunk, input_idx);
 	if (filter_sel) {
 		auto &filter_mask = gastate.filter_mask;
 		for (idx_t f = 0; f < filtered; ++f) {
@@ -72,18 +71,19 @@ void WindowAggregatorLocalState::InitSubFrames(SubFrames &frames, const WindowEx
 	frames.resize(nframes, {0, 0});
 }
 
-void WindowAggregatorLocalState::Finalize(WindowAggregatorGlobalState &gastate, CollectionPtr collection) {
+void WindowAggregatorLocalState::Finalize(ExecutionContext &context, WindowAggregatorGlobalState &gastate,
+                                          CollectionPtr collection) {
 	// Prepare to scan
 	if (!cursor) {
 		cursor = make_uniq<WindowCursor>(*collection, gastate.aggregator.child_idx);
 	}
 }
 
-void WindowAggregator::Finalize(WindowAggregatorState &gstate, WindowAggregatorState &lstate, CollectionPtr collection,
-                                const FrameStats &stats) {
+void WindowAggregator::Finalize(ExecutionContext &context, WindowAggregatorState &gstate, WindowAggregatorState &lstate,
+                                CollectionPtr collection, const FrameStats &stats, InterruptState &interrupt) {
 	auto &gasink = gstate.Cast<WindowAggregatorGlobalState>();
 	auto &lastate = lstate.Cast<WindowAggregatorLocalState>();
-	lastate.Finalize(gasink, collection);
+	lastate.Finalize(context, gasink, collection);
 }
 
 } // namespace duckdb

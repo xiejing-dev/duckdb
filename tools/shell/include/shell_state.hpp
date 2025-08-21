@@ -12,14 +12,16 @@
 #include <string>
 #include <cstdint>
 #include <memory>
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/unique_ptr.hpp"
 
 struct sqlite3;
 struct sqlite3_stmt;
 enum class MetadataResult : uint8_t;
 
 namespace duckdb_shell {
+using duckdb::unique_ptr;
 using std::string;
-using std::unique_ptr;
 using std::vector;
 struct ColumnarResult;
 struct RowResult;
@@ -54,6 +56,8 @@ enum class RenderMode : uint32_t {
 
 enum class PrintOutput { STDOUT, STDERR };
 
+enum class InputMode { STANDARD, FILE };
+
 enum class LargeNumberRendering { NONE = 0, FOOTER = 1, ALL = 2, DEFAULT = 3 };
 
 /*
@@ -69,7 +73,7 @@ enum class LargeNumberRendering { NONE = 0, FOOTER = 1, ALL = 2, DEFAULT = 3 };
 #define SHFLG_HeaderSet     0x00000080 /* .header has been used */
 
 /* ctype macros that work with signed characters */
-#define IsSpace(X) isspace((unsigned char)X)
+#define IsSpace(X) duckdb::StringUtil::CharacterIsSpace((unsigned char)X)
 #define IsDigit(X) isdigit((unsigned char)X)
 #define ToLower(X) (char)tolower((unsigned char)X)
 
@@ -119,6 +123,8 @@ public:
 	char thousand_separator = '\0';
 	//! When to use formatting of large numbers (in DuckBox mode)
 	LargeNumberRendering large_number_rendering = LargeNumberRendering::DEFAULT;
+	//! The command to execute when `-ui` is passed in
+	string ui_command = "CALL start_ui()";
 
 public:
 	void PushOutputMode();
@@ -172,6 +178,7 @@ public:
 
 	void PrintDatabaseError(const char *zErr);
 	int ShellDatabaseError(sqlite3 *db);
+	int RunInitialCommand(char *sql, bool bail);
 
 	int RenderRow(RowRenderer &renderer, RowResult &result);
 
@@ -198,9 +205,11 @@ public:
 	void NewTempFile(const char *zSuffix);
 	int DoMetaCommand(char *zLine);
 
-	int RunOneSqlLine(char *zSql);
-	void ProcessDuckDBRC(const char *sqliterc_override);
-	int ProcessInput();
+	int RunOneSqlLine(InputMode mode, char *zSql);
+	string GetDefaultDuckDBRC();
+	bool ProcessDuckDBRC(const char *file);
+	bool ProcessFile(const string &file, bool is_duckdb_rc = false);
+	int ProcessInput(InputMode mode);
 };
 
 } // namespace duckdb_shell

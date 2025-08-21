@@ -65,6 +65,8 @@ static py::list PyTokenize(const string &query) {
 		case SimplifiedTokenType::SIMPLIFIED_TOKEN_COMMENT:
 			tuple[1] = PY_SQL_TOKEN_COMMENT;
 			break;
+		default:
+			break;
 		}
 		result.append(tuple);
 	}
@@ -318,6 +320,15 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    },
 	    "Interrupt pending operations", py::kw_only(), py::arg("connection") = py::none());
 	m.def(
+	    "query_progress",
+	    [](shared_ptr<DuckDBPyConnection> conn = nullptr) {
+		    if (!conn) {
+			    conn = DuckDBPyConnection::DefaultConnection();
+		    }
+		    return conn->QueryProgress();
+	    },
+	    "Query progress of pending operation", py::kw_only(), py::arg("connection") = py::none());
+	m.def(
 	    "fetchone",
 	    [](shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
@@ -397,14 +408,14 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    py::arg("date_as_object") = false, py::arg("connection") = py::none());
 	m.def(
 	    "pl",
-	    [](idx_t rows_per_batch, shared_ptr<DuckDBPyConnection> conn = nullptr) {
+	    [](idx_t rows_per_batch, bool lazy, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
 			    conn = DuckDBPyConnection::DefaultConnection();
 		    }
-		    return conn->FetchPolars(rows_per_batch);
+		    return conn->FetchPolars(rows_per_batch, lazy);
 	    },
 	    "Fetch a result as Polars DataFrame following execute()", py::arg("rows_per_batch") = 1000000, py::kw_only(),
-	    py::arg("connection") = py::none());
+	    py::arg("lazy") = false, py::arg("connection") = py::none());
 	m.def(
 	    "fetch_arrow_table",
 	    [](idx_t rows_per_batch, shared_ptr<DuckDBPyConnection> conn = nullptr) {
@@ -416,17 +427,17 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    "Fetch a result as Arrow table following execute()", py::arg("rows_per_batch") = 1000000, py::kw_only(),
 	    py::arg("connection") = py::none());
 	m.def(
-	    "arrow",
-	    [](idx_t rows_per_batch, shared_ptr<DuckDBPyConnection> conn = nullptr) {
+	    "fetch_record_batch",
+	    [](const idx_t rows_per_batch, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
 			    conn = DuckDBPyConnection::DefaultConnection();
 		    }
-		    return conn->FetchArrow(rows_per_batch);
+		    return conn->FetchRecordBatchReader(rows_per_batch);
 	    },
-	    "Fetch a result as Arrow table following execute()", py::arg("rows_per_batch") = 1000000, py::kw_only(),
+	    "Fetch an Arrow RecordBatchReader following execute()", py::arg("rows_per_batch") = 1000000, py::kw_only(),
 	    py::arg("connection") = py::none());
 	m.def(
-	    "fetch_record_batch",
+	    "arrow",
 	    [](const idx_t rows_per_batch, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
 			    conn = DuckDBPyConnection::DefaultConnection();
@@ -753,54 +764,14 @@ static void InitializeConnectionMethods(py::module_ &m) {
 	    py::arg("filename") = false, py::arg("hive_partitioning") = false, py::arg("union_by_name") = false,
 	    py::arg("compression") = py::none(), py::arg("connection") = py::none());
 	m.def(
-	    "from_substrait",
-	    [](py::bytes &proto, shared_ptr<DuckDBPyConnection> conn = nullptr) {
-		    if (!conn) {
-			    conn = DuckDBPyConnection::DefaultConnection();
-		    }
-		    return conn->FromSubstrait(proto);
-	    },
-	    "Create a query object from protobuf plan", py::arg("proto"), py::kw_only(),
-	    py::arg("connection") = py::none());
-	m.def(
-	    "get_substrait",
-	    [](const string &query, bool enable_optimizer = true, shared_ptr<DuckDBPyConnection> conn = nullptr) {
-		    if (!conn) {
-			    conn = DuckDBPyConnection::DefaultConnection();
-		    }
-		    return conn->GetSubstrait(query, enable_optimizer);
-	    },
-	    "Serialize a query to protobuf", py::arg("query"), py::kw_only(), py::arg("enable_optimizer") = true,
-	    py::arg("connection") = py::none());
-	m.def(
-	    "get_substrait_json",
-	    [](const string &query, bool enable_optimizer = true, shared_ptr<DuckDBPyConnection> conn = nullptr) {
-		    if (!conn) {
-			    conn = DuckDBPyConnection::DefaultConnection();
-		    }
-		    return conn->GetSubstraitJSON(query, enable_optimizer);
-	    },
-	    "Serialize a query to protobuf on the JSON format", py::arg("query"), py::kw_only(),
-	    py::arg("enable_optimizer") = true, py::arg("connection") = py::none());
-	m.def(
-	    "from_substrait_json",
-	    [](const string &json, shared_ptr<DuckDBPyConnection> conn = nullptr) {
-		    if (!conn) {
-			    conn = DuckDBPyConnection::DefaultConnection();
-		    }
-		    return conn->FromSubstraitJSON(json);
-	    },
-	    "Create a query object from a JSON protobuf plan", py::arg("json"), py::kw_only(),
-	    py::arg("connection") = py::none());
-	m.def(
 	    "get_table_names",
-	    [](const string &query, shared_ptr<DuckDBPyConnection> conn = nullptr) {
+	    [](const string &query, bool qualified, shared_ptr<DuckDBPyConnection> conn = nullptr) {
 		    if (!conn) {
 			    conn = DuckDBPyConnection::DefaultConnection();
 		    }
-		    return conn->GetTableNames(query);
+		    return conn->GetTableNames(query, qualified);
 	    },
-	    "Extract the required table names from a query", py::arg("query"), py::kw_only(),
+	    "Extract the required table names from a query", py::arg("query"), py::kw_only(), py::arg("qualified") = false,
 	    py::arg("connection") = py::none());
 	m.def(
 	    "install_extension",
@@ -1000,21 +971,21 @@ static void InitializeConnectionMethods(py::module_ &m) {
 static void RegisterStatementType(py::handle &m) {
 	auto statement_type = py::enum_<duckdb::StatementType>(m, "StatementType");
 	static const duckdb::StatementType TYPES[] = {
-	    duckdb::StatementType::INVALID_STATEMENT,      duckdb::StatementType::SELECT_STATEMENT,
-	    duckdb::StatementType::INSERT_STATEMENT,       duckdb::StatementType::UPDATE_STATEMENT,
-	    duckdb::StatementType::CREATE_STATEMENT,       duckdb::StatementType::DELETE_STATEMENT,
-	    duckdb::StatementType::PREPARE_STATEMENT,      duckdb::StatementType::EXECUTE_STATEMENT,
-	    duckdb::StatementType::ALTER_STATEMENT,        duckdb::StatementType::TRANSACTION_STATEMENT,
-	    duckdb::StatementType::COPY_STATEMENT,         duckdb::StatementType::ANALYZE_STATEMENT,
-	    duckdb::StatementType::VARIABLE_SET_STATEMENT, duckdb::StatementType::CREATE_FUNC_STATEMENT,
-	    duckdb::StatementType::EXPLAIN_STATEMENT,      duckdb::StatementType::DROP_STATEMENT,
-	    duckdb::StatementType::EXPORT_STATEMENT,       duckdb::StatementType::PRAGMA_STATEMENT,
-	    duckdb::StatementType::VACUUM_STATEMENT,       duckdb::StatementType::CALL_STATEMENT,
-	    duckdb::StatementType::SET_STATEMENT,          duckdb::StatementType::LOAD_STATEMENT,
-	    duckdb::StatementType::RELATION_STATEMENT,     duckdb::StatementType::EXTENSION_STATEMENT,
-	    duckdb::StatementType::LOGICAL_PLAN_STATEMENT, duckdb::StatementType::ATTACH_STATEMENT,
-	    duckdb::StatementType::DETACH_STATEMENT,       duckdb::StatementType::MULTI_STATEMENT,
-	    duckdb::StatementType::COPY_DATABASE_STATEMENT};
+	    duckdb::StatementType::INVALID_STATEMENT,       duckdb::StatementType::SELECT_STATEMENT,
+	    duckdb::StatementType::INSERT_STATEMENT,        duckdb::StatementType::UPDATE_STATEMENT,
+	    duckdb::StatementType::CREATE_STATEMENT,        duckdb::StatementType::DELETE_STATEMENT,
+	    duckdb::StatementType::PREPARE_STATEMENT,       duckdb::StatementType::EXECUTE_STATEMENT,
+	    duckdb::StatementType::ALTER_STATEMENT,         duckdb::StatementType::TRANSACTION_STATEMENT,
+	    duckdb::StatementType::COPY_STATEMENT,          duckdb::StatementType::ANALYZE_STATEMENT,
+	    duckdb::StatementType::VARIABLE_SET_STATEMENT,  duckdb::StatementType::CREATE_FUNC_STATEMENT,
+	    duckdb::StatementType::EXPLAIN_STATEMENT,       duckdb::StatementType::DROP_STATEMENT,
+	    duckdb::StatementType::EXPORT_STATEMENT,        duckdb::StatementType::PRAGMA_STATEMENT,
+	    duckdb::StatementType::VACUUM_STATEMENT,        duckdb::StatementType::CALL_STATEMENT,
+	    duckdb::StatementType::SET_STATEMENT,           duckdb::StatementType::LOAD_STATEMENT,
+	    duckdb::StatementType::RELATION_STATEMENT,      duckdb::StatementType::EXTENSION_STATEMENT,
+	    duckdb::StatementType::LOGICAL_PLAN_STATEMENT,  duckdb::StatementType::ATTACH_STATEMENT,
+	    duckdb::StatementType::DETACH_STATEMENT,        duckdb::StatementType::MULTI_STATEMENT,
+	    duckdb::StatementType::COPY_DATABASE_STATEMENT, duckdb::StatementType::MERGE_INTO_STATEMENT};
 	static const idx_t AMOUNT = sizeof(TYPES) / sizeof(duckdb::StatementType);
 	for (idx_t i = 0; i < AMOUNT; i++) {
 		auto &type = TYPES[i];
@@ -1077,6 +1048,7 @@ PYBIND11_MODULE(DUCKDB_PYTHON_LIB_NAME, m) { // NOLINT
 	m.attr("__git_revision__") = DuckDB::SourceID();
 	m.attr("__interactive__") = DuckDBPyConnection::DetectAndGetEnvironment();
 	m.attr("__jupyter__") = DuckDBPyConnection::IsJupyter();
+	m.attr("__formatted_python_version__") = DuckDBPyConnection::FormattedPythonVersion();
 	m.def("default_connection", &DuckDBPyConnection::DefaultConnection,
 	      "Retrieve the connection currently registered as the default to be used by the module");
 	m.def("set_default_connection", &DuckDBPyConnection::SetDefaultConnection,

@@ -1,4 +1,6 @@
 #include "duckdb/function/window/window_constant_aggregator.hpp"
+
+#include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/window/window_aggregate_states.hpp"
 #include "duckdb/function/window/window_shared_expressions.hpp"
 #include "duckdb/planner/expression/bound_window_expression.hpp"
@@ -6,7 +8,7 @@
 namespace duckdb {
 
 //===--------------------------------------------------------------------===//
-// WindowConstantAggregator
+// WindowConstantAggregatorGlobalState
 //===--------------------------------------------------------------------===//
 
 class WindowConstantAggregatorGlobalState : public WindowAggregatorGlobalState {
@@ -16,39 +18,16 @@ public:
 
 	void Finalize(const FrameStats &stats);
 
+	~WindowConstantAggregatorGlobalState() override {
+		statef.Destroy();
+	}
+
 	//! Partition starts
 	vector<idx_t> partition_offsets;
 	//! Reused result state container for the window functions
 	WindowAggregateStates statef;
 	//! Aggregate results
 	unique_ptr<Vector> results;
-};
-
-class WindowConstantAggregatorLocalState : public WindowAggregatorLocalState {
-public:
-	explicit WindowConstantAggregatorLocalState(const WindowConstantAggregatorGlobalState &gstate);
-	~WindowConstantAggregatorLocalState() override {
-	}
-
-	void Sink(DataChunk &sink_chunk, DataChunk &coll_chunk, idx_t input_idx, optional_ptr<SelectionVector> filter_sel,
-	          idx_t filtered);
-	void Combine(WindowConstantAggregatorGlobalState &gstate);
-
-public:
-	//! The global state we are sharing
-	const WindowConstantAggregatorGlobalState &gstate;
-	//! Reusable chunk for sinking
-	DataChunk inputs;
-	//! Chunk for referencing the input columns
-	DataChunk payload_chunk;
-	//! A vector of pointers to "state", used for intermediate window segment aggregation
-	Vector statep;
-	//! Reused result state container for the window functions
-	WindowAggregateStates statef;
-	//! The current result partition being read
-	idx_t partition;
-	//! Shared SV for evaluation
-	SelectionVector matches;
 };
 
 WindowConstantAggregatorGlobalState::WindowConstantAggregatorGlobalState(ClientContext &context,
@@ -93,6 +72,36 @@ WindowConstantAggregatorGlobalState::WindowConstantAggregatorGlobalState(ClientC
 	partition_offsets.emplace_back(group_count);
 }
 
+//===--------------------------------------------------------------------===//
+// WindowConstantAggregatorLocalState
+//===--------------------------------------------------------------------===//
+class WindowConstantAggregatorLocalState : public WindowAggregatorLocalState {
+public:
+	explicit WindowConstantAggregatorLocalState(const WindowConstantAggregatorGlobalState &gstate);
+	~WindowConstantAggregatorLocalState() override {
+	}
+
+	void Sink(ExecutionContext &context, DataChunk &sink_chunk, DataChunk &coll_chunk, idx_t input_idx,
+	          optional_ptr<SelectionVector> filter_sel, idx_t filtered);
+	void Combine(WindowConstantAggregatorGlobalState &gstate);
+
+public:
+	//! The global state we are sharing
+	const WindowConstantAggregatorGlobalState &gstate;
+	//! Reusable chunk for sinking
+	DataChunk inputs;
+	//! Chunk for referencing the input columns
+	DataChunk payload_chunk;
+	//! A vector of pointers to "state", used for intermediate window segment aggregation
+	Vector statep;
+	//! Reused result state container for the window functions
+	WindowAggregateStates statef;
+	//! The current result partition being read
+	idx_t partition;
+	//! Shared SV for evaluation
+	SelectionVector matches;
+};
+
 WindowConstantAggregatorLocalState::WindowConstantAggregatorLocalState(
     const WindowConstantAggregatorGlobalState &gstate)
     : gstate(gstate), statep(Value::POINTER(0)), statef(gstate.statef.aggr), partition(0) {
@@ -110,10 +119,81 @@ WindowConstantAggregatorLocalState::WindowConstantAggregatorLocalState(
 	gstate.locals++;
 }
 
-WindowConstantAggregator::WindowConstantAggregator(const BoundWindowExpression &wexpr,
-                                                   const WindowExcludeMode exclude_mode_p,
-                                                   WindowSharedExpressions &shared)
-    : WindowAggregator(wexpr, exclude_mode_p) {
+//===--------------------------------------------------------------------===//
+// WindowConstantAggregator
+//===--------------------------------------------------------------------===//
+bool WindowConstantAggregator::CanAggregate(const BoundWindowExpression &wexpr) {
+	if (!wexpr.aggregate) {
+		return false;
+	}
+	// window exclusion cannot be handled by constant aggregates
+	if (wexpr.exclude_clause != WindowExcludeMode::NO_OTHER) {
+		return false;
+	}
+
+	// 	DISTINCT aggregation cannot be handled by constant aggregation
+	if (wexpr.distinct) {
+		return false;
+	}
+
+	//	COUNT(*) is already handled efficiently by segment trees.
+	if (wexpr.children.empty()) {
+		return false;
+	}
+
+	/*
+	    The default framing option is RANGE UNBOUNDED PRECEDING, which
+	    is the same as RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
+	    ROW; it sets the frame to be all rows from the partition start
+	    up through the current row's last peer (a row that the window's
+	    ORDER BY clause considers equivalent to the current row; all
+	    rows are peers if there is no ORDER BY). In general, UNBOUNDED
+	    PRECEDING means that the frame starts with the first row of the
+	    partition, and similarly UNBOUNDED FOLLOWING means that the
+	    frame ends with the last row of the partition, regardless of
+	    RANGE, ROWS or GROUPS mode. In ROWS mode, CURRENT ROW means that
+	    the frame starts or ends with the current row; but in RANGE or
+	    GROUPS mode it means that the frame starts or ends with the
+	    current row's first or last peer in the ORDER BY ordering. The
+	    offset PRECEDING and offset FOLLOWING options vary in meaning
+	    depending on the frame mode.
+	*/
+	switch (wexpr.start) {
+	case WindowBoundary::UNBOUNDED_PRECEDING:
+		break;
+	case WindowBoundary::CURRENT_ROW_RANGE:
+		if (!wexpr.orders.empty()) {
+			return false;
+		}
+		break;
+	default:
+		return false;
+	}
+
+	switch (wexpr.end) {
+	case WindowBoundary::UNBOUNDED_FOLLOWING:
+		break;
+	case WindowBoundary::CURRENT_ROW_RANGE:
+		if (!wexpr.orders.empty()) {
+			return false;
+		}
+		break;
+	default:
+		return false;
+	}
+
+	return true;
+}
+
+BoundWindowExpression &WindowConstantAggregator::RebindAggregate(ClientContext &context, BoundWindowExpression &wexpr) {
+	FunctionBinder::BindSortedAggregate(context, wexpr);
+
+	return wexpr;
+}
+
+WindowConstantAggregator::WindowConstantAggregator(BoundWindowExpression &wexpr, WindowSharedExpressions &shared,
+                                                   ClientContext &context)
+    : WindowAggregator(RebindAggregate(context, wexpr)) {
 
 	// We only need these values for Sink
 	for (auto &child : wexpr.children) {
@@ -126,16 +206,17 @@ unique_ptr<WindowAggregatorState> WindowConstantAggregator::GetGlobalState(Clien
 	return make_uniq<WindowConstantAggregatorGlobalState>(context, *this, group_count, partition_mask);
 }
 
-void WindowConstantAggregator::Sink(WindowAggregatorState &gsink, WindowAggregatorState &lstate, DataChunk &sink_chunk,
-                                    DataChunk &coll_chunk, idx_t input_idx, optional_ptr<SelectionVector> filter_sel,
-                                    idx_t filtered) {
+void WindowConstantAggregator::Sink(ExecutionContext &context, WindowAggregatorState &gsink,
+                                    WindowAggregatorState &lstate, DataChunk &sink_chunk, DataChunk &coll_chunk,
+                                    idx_t input_idx, optional_ptr<SelectionVector> filter_sel, idx_t filtered,
+                                    InterruptState &interrupt) {
 	auto &lastate = lstate.Cast<WindowConstantAggregatorLocalState>();
 
-	lastate.Sink(sink_chunk, coll_chunk, input_idx, filter_sel, filtered);
+	lastate.Sink(context, sink_chunk, coll_chunk, input_idx, filter_sel, filtered);
 }
 
-void WindowConstantAggregatorLocalState::Sink(DataChunk &sink_chunk, DataChunk &coll_chunk, idx_t row,
-                                              optional_ptr<SelectionVector> filter_sel, idx_t filtered) {
+void WindowConstantAggregatorLocalState::Sink(ExecutionContext &context, DataChunk &sink_chunk, DataChunk &coll_chunk,
+                                              idx_t row, optional_ptr<SelectionVector> filter_sel, idx_t filtered) {
 	auto &partition_offsets = gstate.partition_offsets;
 	const auto &aggr = gstate.aggr;
 	const auto chunk_begin = row;
@@ -218,8 +299,9 @@ void WindowConstantAggregatorLocalState::Sink(DataChunk &sink_chunk, DataChunk &
 	}
 }
 
-void WindowConstantAggregator::Finalize(WindowAggregatorState &gstate, WindowAggregatorState &lstate,
-                                        CollectionPtr collection, const FrameStats &stats) {
+void WindowConstantAggregator::Finalize(ExecutionContext &context, WindowAggregatorState &gstate,
+                                        WindowAggregatorState &lstate, CollectionPtr collection,
+                                        const FrameStats &stats, InterruptState &interrupt) {
 	auto &gastate = gstate.Cast<WindowConstantAggregatorGlobalState>();
 	auto &lastate = lstate.Cast<WindowConstantAggregatorLocalState>();
 
@@ -228,10 +310,8 @@ void WindowConstantAggregator::Finalize(WindowAggregatorState &gstate, WindowAgg
 	lastate.statef.Combine(gastate.statef);
 	lastate.statef.Destroy();
 
-	//	Last one out turns off the lights!
-	if (++gastate.finalized == gastate.locals) {
+	if (!--gastate.locals) {
 		gastate.statef.Finalize(*gastate.results);
-		gastate.statef.Destroy();
 	}
 }
 
@@ -239,8 +319,9 @@ unique_ptr<WindowAggregatorState> WindowConstantAggregator::GetLocalState(const 
 	return make_uniq<WindowConstantAggregatorLocalState>(gstate.Cast<WindowConstantAggregatorGlobalState>());
 }
 
-void WindowConstantAggregator::Evaluate(const WindowAggregatorState &gsink, WindowAggregatorState &lstate,
-                                        const DataChunk &bounds, Vector &result, idx_t count, idx_t row_idx) const {
+void WindowConstantAggregator::Evaluate(ExecutionContext &context, const WindowAggregatorState &gsink,
+                                        WindowAggregatorState &lstate, const DataChunk &bounds, Vector &result,
+                                        idx_t count, idx_t row_idx, InterruptState &interrupt) const {
 	auto &gasink = gsink.Cast<WindowConstantAggregatorGlobalState>();
 	const auto &partition_offsets = gasink.partition_offsets;
 	const auto &results = *gasink.results;

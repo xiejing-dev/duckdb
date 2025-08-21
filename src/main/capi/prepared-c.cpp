@@ -73,7 +73,7 @@ duckdb_state duckdb_prepare(duckdb_connection connection, const char *query,
 	auto wrapper = new PreparedStatementWrapper();
 	Connection *conn = reinterpret_cast<Connection *>(connection);
 	wrapper->statement = conn->Prepare(query);
-	*out_prepared_statement = (duckdb_prepared_statement)wrapper;
+	*out_prepared_statement = reinterpret_cast<duckdb_prepared_statement>(wrapper);
 	return !wrapper->statement->HasError() ? DuckDBSuccess : DuckDBError;
 }
 
@@ -128,7 +128,6 @@ duckdb_type duckdb_param_type(duckdb_prepared_statement prepared_statement, idx_
 	}
 
 	auto type = duckdb_get_type_id(logical_type);
-
 	duckdb_destroy_logical_type(&logical_type);
 
 	return type;

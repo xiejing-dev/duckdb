@@ -11,7 +11,7 @@
         "parameters": "keys,values",
         "description": "Creates a map from a set of keys and values",
         "example": "map(['key1', 'key2'], ['val1', 'val2'])",
-        "type": "scalar_function"
+        "type": "scalar_function_set"
     },
     {
         "name": "map_entries",
@@ -29,6 +29,13 @@
         "aliases": ["element_at"]
     },
     {
+        "name": "map_extract_value",
+        "parameters": "map,key",
+        "description": "Returns the value for a given key or NULL if the key is not contained in the map. The type of the key provided in the second parameter must match the type of the map’s keys else an error is returned",
+        "example": "map_extract_value(map(['key'], ['val']), 'key')",
+        "type": "scalar_function"
+    },
+    {
         "name": "map_from_entries",
         "parameters": "map",
         "description": "Returns a map created from the entries of the array",
@@ -39,7 +46,7 @@
         "name": "map_concat",
         "parameters": "any,...",
         "description": "Returns a map created from merging the input maps, on key collision the value is taken from the last map with that key",
-        "example": "map_concat(map([1,2], ['a', 'b']), map([2,3], ['c', 'd']));",
+        "example": "map_concat(map([1, 2], ['a', 'b']), map([2, 3], ['c', 'd']));",
         "type": "scalar_function"
     },
     {

@@ -63,6 +63,9 @@ public:
 	inline void SetCardinality(const DataChunk &other) {
 		SetCardinality(other.size());
 	}
+	inline idx_t GetCapacity() const {
+		return capacity;
+	}
 	inline void SetCapacity(idx_t capacity_p) {
 		this->capacity = capacity_p;
 	}
@@ -140,7 +143,7 @@ public:
 	//! Vector to point back to the data owned by this DataChunk.
 	DUCKDB_API void Reset();
 
-	DUCKDB_API void Serialize(Serializer &serializer) const;
+	DUCKDB_API void Serialize(Serializer &serializer, bool compressed_serialization = true) const;
 	DUCKDB_API void Deserialize(Deserializer &source);
 
 	//! Hashes the DataChunk to the target vector

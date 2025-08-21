@@ -6,6 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#pragma once
+
 #include "duckdb/function/window/window_executor.hpp"
 #include "duckdb/common/enums/window_aggregation_mode.hpp"
 #include "duckdb/function/window/window_aggregator.hpp"
@@ -14,21 +16,20 @@ namespace duckdb {
 
 class WindowAggregateExecutor : public WindowExecutor {
 public:
-	WindowAggregateExecutor(BoundWindowExpression &wexpr, ClientContext &context, WindowSharedExpressions &shared,
+	WindowAggregateExecutor(BoundWindowExpression &wexpr, ClientContext &client, WindowSharedExpressions &shared,
 	                        WindowAggregationMode mode);
 
-	bool IsConstantAggregate();
-	bool IsCustomAggregate();
-	bool IsDistinctAggregate();
+	void Sink(ExecutionContext &context, DataChunk &sink_chunk, DataChunk &coll_chunk, const idx_t input_idx,
+	          WindowExecutorGlobalState &gstate, WindowExecutorLocalState &lstate,
+	          InterruptState &interrupt) const override;
+	void Finalize(ExecutionContext &context, WindowExecutorGlobalState &gstate, WindowExecutorLocalState &lstate,
+	              CollectionPtr collection, InterruptState &interrupt) const override;
 
-	void Sink(DataChunk &sink_chunk, DataChunk &coll_chunk, const idx_t input_idx, WindowExecutorGlobalState &gstate,
-	          WindowExecutorLocalState &lstate) const override;
-	void Finalize(WindowExecutorGlobalState &gstate, WindowExecutorLocalState &lstate,
-	              CollectionPtr collection) const override;
-
-	unique_ptr<WindowExecutorGlobalState> GetGlobalState(const idx_t payload_count, const ValidityMask &partition_mask,
+	unique_ptr<WindowExecutorGlobalState> GetGlobalState(ClientContext &client, const idx_t payload_count,
+	                                                     const ValidityMask &partition_mask,
 	                                                     const ValidityMask &order_mask) const override;
-	unique_ptr<WindowExecutorLocalState> GetLocalState(const WindowExecutorGlobalState &gstate) const override;
+	unique_ptr<WindowExecutorLocalState> GetLocalState(ExecutionContext &context,
+	                                                   const WindowExecutorGlobalState &gstate) const override;
 
 	const WindowAggregationMode mode;
 
@@ -39,8 +40,9 @@ public:
 	unique_ptr<Expression> filter_ref;
 
 protected:
-	void EvaluateInternal(WindowExecutorGlobalState &gstate, WindowExecutorLocalState &lstate, DataChunk &eval_chunk,
-	                      Vector &result, idx_t count, idx_t row_idx) const override;
+	void EvaluateInternal(ExecutionContext &context, WindowExecutorGlobalState &gstate,
+	                      WindowExecutorLocalState &lstate, DataChunk &eval_chunk, Vector &result, idx_t count,
+	                      idx_t row_idx, InterruptState &interrupt) const override;
 };
 
 } // namespace duckdb

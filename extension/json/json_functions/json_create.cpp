@@ -67,7 +67,7 @@ static LogicalType GetJSONType(StructNames &const_struct_names, const LogicalTyp
 	case LogicalTypeId::TIMESTAMP_MS:
 	case LogicalTypeId::TIMESTAMP_SEC:
 	case LogicalTypeId::UUID:
-	case LogicalTypeId::VARINT:
+	case LogicalTypeId::BIGNUM:
 	case LogicalTypeId::DECIMAL:
 		return type;
 	case LogicalTypeId::LIST:
@@ -547,8 +547,6 @@ static void CreateValues(const StructNames &names, yyjson_mut_doc *doc, yyjson_m
 	case LogicalTypeId::DOUBLE:
 		TemplatedCreateValues<double, double>(doc, vals, value_v, count);
 		break;
-	case LogicalTypeId::BIT:
-	case LogicalTypeId::BLOB:
 	case LogicalTypeId::VARCHAR:
 		TemplatedCreateValues<string_t, string_t>(doc, vals, value_v, count);
 		break;
@@ -567,11 +565,14 @@ static void CreateValues(const StructNames &names, yyjson_mut_doc *doc, yyjson_m
 	case LogicalTypeId::ARRAY:
 		CreateValuesArray(names, doc, vals, value_v, count);
 		break;
+	case LogicalTypeId::BIT:
+	case LogicalTypeId::BLOB:
 	case LogicalTypeId::AGGREGATE_STATE:
 	case LogicalTypeId::ENUM:
 	case LogicalTypeId::DATE:
 	case LogicalTypeId::INTERVAL:
 	case LogicalTypeId::TIME:
+	case LogicalTypeId::TIME_NS:
 	case LogicalTypeId::TIME_TZ:
 	case LogicalTypeId::TIMESTAMP:
 	case LogicalTypeId::TIMESTAMP_TZ:
@@ -584,7 +585,7 @@ static void CreateValues(const StructNames &names, yyjson_mut_doc *doc, yyjson_m
 		TemplatedCreateValues<string_t, string_t>(doc, vals, string_vector, count);
 		break;
 	}
-	case LogicalTypeId::VARINT: {
+	case LogicalTypeId::BIGNUM: {
 		Vector string_vector(LogicalTypeId::VARCHAR, count);
 		VectorOperations::DefaultCast(value_v, string_vector, count);
 		CreateRawValues(doc, vals, string_vector, count);
@@ -606,6 +607,7 @@ static void CreateValues(const StructNames &names, yyjson_mut_doc *doc, yyjson_m
 	case LogicalTypeId::UNKNOWN:
 	case LogicalTypeId::ANY:
 	case LogicalTypeId::USER:
+	case LogicalTypeId::TEMPLATE:
 	case LogicalTypeId::CHAR:
 	case LogicalTypeId::STRING_LITERAL:
 	case LogicalTypeId::INTEGER_LITERAL:
@@ -621,7 +623,7 @@ static void ObjectFunction(DataChunk &args, ExpressionState &state, Vector &resu
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	const auto &info = func_expr.bind_info->Cast<JSONCreateFunctionData>();
 	auto &lstate = JSONFunctionLocalState::ResetAndGet(state);
-	auto alc = lstate.json_allocator.GetYYAlc();
+	auto alc = lstate.json_allocator->GetYYAlc();
 
 	// Initialize values
 	const idx_t count = args.size();
@@ -646,13 +648,15 @@ static void ObjectFunction(DataChunk &args, ExpressionState &state, Vector &resu
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
+
+	JSONAllocator::AddBuffer(result, alc);
 }
 
 static void ArrayFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	const auto &info = func_expr.bind_info->Cast<JSONCreateFunctionData>();
 	auto &lstate = JSONFunctionLocalState::ResetAndGet(state);
-	auto alc = lstate.json_allocator.GetYYAlc();
+	auto alc = lstate.json_allocator->GetYYAlc();
 
 	// Initialize arrays
 	const idx_t count = args.size();
@@ -678,6 +682,8 @@ static void ArrayFunction(DataChunk &args, ExpressionState &state, Vector &resul
 	if (args.AllConstant()) {
 		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
+
+	JSONAllocator::AddBuffer(result, alc);
 }
 
 static void ToJSONFunctionInternal(const StructNames &names, Vector &input, const idx_t count, Vector &result,
@@ -688,16 +694,31 @@ static void ToJSONFunctionInternal(const StructNames &names, Vector &input, cons
 	CreateValues(names, doc, vals, input, count);
 
 	// Write JSON values to string
-	UnaryExecutor::ExecuteWithNulls<data_t, string_t>(input, result, count, [&](data_t, ValidityMask &, idx_t index) {
-		return JSONCommon::WriteVal<yyjson_mut_val>(vals[index], alc);
-	});
+	auto objects = FlatVector::GetData<string_t>(result);
+	auto &result_validity = FlatVector::Validity(result);
+	UnifiedVectorFormat input_data;
+	input.ToUnifiedFormat(count, input_data);
+	for (idx_t i = 0; i < count; i++) {
+		idx_t idx = input_data.sel->get_index(i);
+		if (input_data.validity.RowIsValid(idx)) {
+			objects[i] = JSONCommon::WriteVal<yyjson_mut_val>(vals[i], alc);
+		} else {
+			result_validity.SetInvalid(i);
+		}
+	}
+
+	if (input.GetVectorType() == VectorType::CONSTANT_VECTOR || count == 1) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
+
+	JSONAllocator::AddBuffer(result, alc);
 }
 
 static void ToJSONFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	const auto &info = func_expr.bind_info->Cast<JSONCreateFunctionData>();
 	auto &lstate = JSONFunctionLocalState::ResetAndGet(state);
-	auto alc = lstate.json_allocator.GetYYAlc();
+	auto alc = lstate.json_allocator->GetYYAlc();
 
 	ToJSONFunctionInternal(info.const_struct_names, args.data[0], args.size(), result, alc);
 }
@@ -758,8 +779,8 @@ public:
 
 static bool AnyToJSONCast(Vector &source, Vector &result, idx_t count, CastParameters &parameters) {
 	auto &lstate = parameters.local_state->Cast<JSONFunctionLocalState>();
-	lstate.json_allocator.Reset();
-	auto alc = lstate.json_allocator.GetYYAlc();
+	lstate.json_allocator->Reset();
+	auto alc = lstate.json_allocator->GetYYAlc();
 	const auto &names = parameters.cast_data->Cast<NestedToJSONCastData>().const_struct_names;
 
 	ToJSONFunctionInternal(names, source, count, result, alc);
@@ -772,7 +793,7 @@ BoundCastInfo AnyToJSONCastBind(BindCastInput &input, const LogicalType &source,
 	return BoundCastInfo(AnyToJSONCast, std::move(cast_data), JSONFunctionLocalState::InitCastLocalState);
 }
 
-void JSONFunctions::RegisterJSONCreateCastFunctions(CastFunctionSet &casts) {
+void JSONFunctions::RegisterJSONCreateCastFunctions(ExtensionLoader &loader) {
 	// Anything can be cast to JSON
 	for (const auto &type : LogicalType::AllTypes()) {
 		LogicalType source_type;
@@ -799,9 +820,9 @@ void JSONFunctions::RegisterJSONCreateCastFunctions(CastFunctionSet &casts) {
 			source_type = type;
 		}
 		// We prefer going to JSON over going to VARCHAR if a function can do either
-		const auto source_to_json_cost =
-		    MaxValue<int64_t>(casts.ImplicitCastCost(source_type, LogicalType::VARCHAR) - 1, 0);
-		casts.RegisterCastFunction(source_type, LogicalType::JSON(), AnyToJSONCastBind, source_to_json_cost);
+		const auto source_to_json_cost = MaxValue<int64_t>(
+		    CastFunctionSet::ImplicitCastCost(loader.GetDatabaseInstance(), source_type, LogicalType::VARCHAR) - 1, 0);
+		loader.RegisterCastFunction(source_type, LogicalType::JSON(), AnyToJSONCastBind, source_to_json_cost);
 	}
 }
 

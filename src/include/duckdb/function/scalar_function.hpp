@@ -78,13 +78,13 @@ struct FunctionModifiedDatabasesInput {
 
 struct FunctionBindExpressionInput {
 	FunctionBindExpressionInput(ClientContext &context_p, optional_ptr<FunctionData> bind_data_p,
-	                            BoundFunctionExpression &function_p)
-	    : context(context_p), bind_data(bind_data_p), function(function_p) {
+	                            vector<unique_ptr<Expression>> &children_p)
+	    : context(context_p), bind_data(bind_data_p), children(children_p) {
 	}
 
 	ClientContext &context;
 	optional_ptr<FunctionData> bind_data;
-	BoundFunctionExpression &function;
+	vector<unique_ptr<Expression>> &children;
 };
 
 struct ScalarFunctionBindInput {
@@ -109,7 +109,9 @@ typedef unique_ptr<FunctionLocalState> (*init_local_state_t)(ExpressionState &st
 //! The type to propagate statistics for this scalar function
 typedef unique_ptr<BaseStatistics> (*function_statistics_t)(ClientContext &context, FunctionStatisticsInput &input);
 //! The type to bind lambda-specific parameter types
-typedef LogicalType (*bind_lambda_function_t)(const idx_t parameter_idx, const LogicalType &list_child_type);
+typedef LogicalType (*bind_lambda_function_t)(ClientContext &context, const vector<LogicalType> &function_child_types,
+                                              idx_t parameter_idx);
+
 //! The type to bind lambda-specific parameter types
 typedef void (*get_modified_databases_t)(ClientContext &context, FunctionModifiedDatabasesInput &input);
 

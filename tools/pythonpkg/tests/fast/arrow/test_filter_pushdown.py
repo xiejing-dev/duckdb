@@ -21,7 +21,7 @@ def create_pyarrow_pandas(rel):
 
 
 def create_pyarrow_table(rel):
-    return rel.arrow()
+    return rel.fetch_arrow_table()
 
 
 def create_pyarrow_dataset(rel):
@@ -30,12 +30,11 @@ def create_pyarrow_dataset(rel):
 
 
 def test_decimal_filter_pushdown(duckdb_cursor):
-    pytest.skip("panic in polars is triggered, to be reviewed")
     pl = pytest.importorskip("polars")
     np = pytest.importorskip("numpy")
     np.random.seed(10)
 
-    df = pl.DataFrame({'x': pl.Series(np.random.uniform(-10, 10, 1000)).cast(pl.Decimal(18, 4))})
+    df = pl.DataFrame({'x': pl.Series(np.random.uniform(-10, 10, 1000)).cast(pl.Decimal(precision=18, scale=4))})
 
     query = """
         SELECT
@@ -553,7 +552,7 @@ class TestArrowFilterPushdown(object):
         df.to_parquet(str(file_path))
 
         my_arrow_dataset = ds.dataset(str(file_path))
-        res = duckdb_cursor.execute("SELECT * FROM my_arrow_dataset WHERE ts = ?", parameters=[dt]).arrow()
+        res = duckdb_cursor.execute("SELECT * FROM my_arrow_dataset WHERE ts = ?", parameters=[dt]).fetch_arrow_table()
         output = duckdb_cursor.sql("select * from res").fetchall()
         expected = [(1, dt), (2, dt), (3, dt)]
         assert output == expected
@@ -704,7 +703,7 @@ class TestArrowFilterPushdown(object):
         duckdb_cursor.execute(f"copy (select * from df2) to '{data2.as_posix()}'")
 
         glob_pattern = tmp_path / 'data*.parquet'
-        table = duckdb_cursor.read_parquet(glob_pattern.as_posix()).arrow()
+        table = duckdb_cursor.read_parquet(glob_pattern.as_posix()).fetch_arrow_table()
 
         output_df = duckdb.arrow(table).filter("date > '2019-01-01'").df()
         expected_df = duckdb.from_parquet(glob_pattern.as_posix()).filter("date > '2019-01-01'").df()
@@ -771,7 +770,7 @@ class TestArrowFilterPushdown(object):
         input = query_res[0][1]
         if 'PANDAS_SCAN' in input:
             pytest.skip(reason="This version of pandas does not produce an Arrow object")
-        match = re.search(r".*ARROW_SCAN.*Filters:.*s\.a<2 AND s\.a IS NOT NULL.*", input, flags=re.DOTALL)
+        match = re.search(r".*ARROW_SCAN.*Filters:.*s\.a<2.*", input, flags=re.DOTALL)
         assert match
 
         # Check that the filter is applied correctly
@@ -785,7 +784,7 @@ class TestArrowFilterPushdown(object):
 
         # the explain-output is pretty cramped, so just make sure we see both struct references.
         match = re.search(
-            r".*ARROW_SCAN.*Filters:.*s\.a<3 AND s\.a IS NOT NULL.*AND s\.b=true AND s\.b IS.*NOT NULL.*",
+            r".*ARROW_SCAN.*Filters:.*s\.a<3.*AND s\.b=true.*",
             query_res[0][1],
             flags=re.DOTALL,
         )
@@ -841,7 +840,7 @@ class TestArrowFilterPushdown(object):
         input = query_res[0][1]
         if 'PANDAS_SCAN' in input:
             pytest.skip(reason="This version of pandas does not produce an Arrow object")
-        match = re.search(r".*ARROW_SCAN.*Filters:.*s\.a\.b<2 AND s\.a\.b IS NOT.*NULL.*", input, flags=re.DOTALL)
+        match = re.search(r".*ARROW_SCAN.*Filters:.*s\.a\.b<2.*", input, flags=re.DOTALL)
         assert match
 
         # Check that the filter is applied correctly
@@ -858,7 +857,7 @@ class TestArrowFilterPushdown(object):
 
         # the explain-output is pretty cramped, so just make sure we see both struct references.
         match = re.search(
-            r".*ARROW_SCAN.*Filters:.*s\.a\.c=true AND s\.a\.c IS.*NOT NULL AND s\.d\.e=5 AND.*s\.d\.e IS NOT NULL.*",
+            r".*ARROW_SCAN.*Filters:.*s\.a\.c=true.*AND s\.d\.e=5.*",
             query_res[0][1],
             flags=re.DOTALL,
         )
@@ -879,7 +878,7 @@ class TestArrowFilterPushdown(object):
 
         res = query_res.fetchone()[1]
         match = re.search(
-            r".*ARROW_SCAN.*Filters:.*s\.d\.f='bar' AND s\.d\.f IS.*NOT NULL.*",
+            r".*ARROW_SCAN.*Filters:.*s\.d\.f='bar'.*",
             res,
             flags=re.DOTALL,
         )
@@ -897,7 +896,7 @@ class TestArrowFilterPushdown(object):
         con.execute(
             "CREATE TABLE T as SELECT i::integer a, i::varchar b, i::uhugeint c, i::integer d FROM range(5) tbl(i)"
         )
-        arrow_tbl = con.execute("FROM T").arrow()
+        arrow_tbl = con.execute("FROM T").fetch_arrow_table()
 
         # No projection just unsupported filter
         assert con.execute("from arrow_tbl where c == 3").fetchall() == [(3, '3', 3, 3)]
@@ -921,7 +920,7 @@ class TestArrowFilterPushdown(object):
             "CREATE TABLE T_2 as SELECT i::integer a, i::varchar b, i::uhugeint c, i::integer d , i::uhugeint e, i::smallint f, i::uhugeint g FROM range(50) tbl(i)"
         )
 
-        arrow_tbl = con.execute("FROM T_2").arrow()
+        arrow_tbl = con.execute("FROM T_2").fetch_arrow_table()
 
         assert con.execute(
             "select a, b from arrow_tbl where a > 2 and c < 40 and b == '28' and g > 15 and e < 30"
@@ -930,11 +929,11 @@ class TestArrowFilterPushdown(object):
     def test_join_filter_pushdown(self, duckdb_cursor):
         duckdb_conn = duckdb.connect()
         duckdb_conn.execute("CREATE TABLE probe as select range a from range(10000);")
-        duckdb_conn.execute("CREATE TABLE build as select (random()*10000)::INT b from range(20);")
+        duckdb_conn.execute("CREATE TABLE build as select (random()*9999)::INT b from range(20);")
         duck_probe = duckdb_conn.table("probe")
         duck_build = duckdb_conn.table("build")
-        duck_probe_arrow = duck_probe.arrow()
-        duck_build_arrow = duck_build.arrow()
+        duck_probe_arrow = duck_probe.fetch_arrow_table()
+        duck_build_arrow = duck_build.fetch_arrow_table()
         duckdb_conn.register("duck_probe_arrow", duck_probe_arrow)
         duckdb_conn.register("duck_build_arrow", duck_build_arrow)
         assert duckdb_conn.execute("SELECT count(*) from duck_probe_arrow, duck_build_arrow where a=b").fetchall() == [
@@ -945,6 +944,78 @@ class TestArrowFilterPushdown(object):
         duckdb_conn = duckdb.connect()
         duckdb_conn.execute("CREATE TABLE probe as select range a from range(1000);")
         duck_probe = duckdb_conn.table("probe")
-        duck_probe_arrow = duck_probe.arrow()
+        duck_probe_arrow = duck_probe.fetch_arrow_table()
         duckdb_conn.register("duck_probe_arrow", duck_probe_arrow)
-        assert duckdb_conn.execute("SELECT * from duck_probe_arrow where a in (1, 999)").fetchall() == [(1,), (999,)]
+        assert duckdb_conn.execute("SELECT * from duck_probe_arrow where a = any([1,999])").fetchall() == [(1,), (999,)]
+
+    def test_pushdown_of_optional_filter(self, duckdb_cursor):
+        cardinality_table = pa.Table.from_pydict(
+            {
+                'column_name': [
+                    'id',
+                    'product_code',
+                    'price',
+                    'quantity',
+                    'category',
+                    'is_available',
+                    'rating',
+                    'discount',
+                    'color',
+                ],
+                'cardinality': [100, 100, 100, 45, 5, 3, 6, 39, 5],
+            }
+        )
+
+        result = duckdb.query(
+            """
+            SELECT *
+            FROM cardinality_table
+            WHERE cardinality > 1
+            ORDER BY cardinality ASC
+        """
+        )
+        res = result.fetchall()
+        assert res == [
+            ('is_available', 3),
+            ('category', 5),
+            ('color', 5),
+            ('rating', 6),
+            ('discount', 39),
+            ('quantity', 45),
+            ('id', 100),
+            ('product_code', 100),
+            ('price', 100),
+        ]
+
+    # DuckDB intentionally violates IEEE-754 when it comes to NaNs, ensuring a total ordering where NaN is the greatest value
+    def test_nan_filter_pushdown(self, duckdb_cursor):
+        duckdb_cursor.execute(
+            """
+            create table test as select a::DOUBLE a from VALUES
+                ('inf'),
+                ('nan'),
+                ('0.34234'),
+                ('34234234.00005'),
+                ('-nan')
+            t(a);
+        """
+        )
+
+        def assert_equal_results(con, arrow_table, query):
+            duckdb_res = con.sql(query.format(table='test')).fetchall()
+            arrow_res = con.sql(query.format(table='arrow_table')).fetchall()
+            assert len(duckdb_res) == len(arrow_res)
+
+        arrow_table = duckdb_cursor.table('test').fetch_arrow_table()
+        assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a > 'NaN'::FLOAT")
+        assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a >= 'NaN'::FLOAT")
+        assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a < 'NaN'::FLOAT")
+        assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a <= 'NaN'::FLOAT")
+        assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a = 'NaN'::FLOAT")
+        assert_equal_results(duckdb_cursor, arrow_table, "select * from {table} where a != 'NaN'::FLOAT")
+
+    def test_dynamic_filter(self, duckdb_cursor):
+        t = pa.Table.from_pydict({"a": [3, 24, 234, 234, 234, 234, 234, 234, 234, 45, 2, 5, 2, 45]})
+        duckdb_cursor.register("t", t)
+        res = duckdb_cursor.sql("SELECT a FROM t ORDER BY a LIMIT 11").fetchall()
+        assert len(res) == 11

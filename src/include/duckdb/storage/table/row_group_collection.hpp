@@ -60,7 +60,7 @@ public:
 	void Verify();
 
 	void InitializeScan(CollectionScanState &state, const vector<StorageIndex> &column_ids,
-	                    TableFilterSet *table_filters);
+	                    optional_ptr<TableFilterSet> table_filters);
 	void InitializeCreateIndexScan(CreateIndexScanState &state);
 	void InitializeScanWithOffset(CollectionScanState &state, const vector<StorageIndex> &column_ids, idx_t start_row,
 	                              idx_t end_row);
@@ -75,6 +75,8 @@ public:
 
 	void Fetch(TransactionData transaction, DataChunk &result, const vector<StorageIndex> &column_ids,
 	           const Vector &row_identifiers, idx_t fetch_count, ColumnFetchState &state);
+	//! Returns true, if the row group can fetch the row id for the transaction.
+	bool CanFetch(TransactionData, const row_t row_id);
 
 	//! Initialize an append of a variable number of rows. FinalizeAppend must be called after appending is done.
 	void InitializeAppend(TableAppendState &state);
@@ -108,9 +110,10 @@ public:
 	                         bool schedule_vacuum);
 	unique_ptr<CheckpointTask> GetCheckpointTask(CollectionCheckpointState &checkpoint_state, idx_t segment_idx);
 
-	void CommitDropColumn(idx_t index);
+	void CommitDropColumn(const idx_t column_index);
 	void CommitDropTable();
 
+	vector<PartitionStatistics> GetPartitionStats() const;
 	vector<ColumnSegmentInfo> GetColumnSegmentInfo();
 	const vector<LogicalType> &GetTypes() const;
 
@@ -123,6 +126,7 @@ public:
 
 	void CopyStats(TableStatistics &stats);
 	unique_ptr<BaseStatistics> CopyStats(column_t column_id);
+	unique_ptr<BlockingSample> GetSample();
 	void SetDistinct(column_t column_id, unique_ptr<DistinctStatistics> distinct_stats);
 
 	AttachedDatabase &GetAttached();
@@ -162,7 +166,9 @@ private:
 	//! Table statistics
 	TableStatistics stats;
 	//! Allocation size, only tracked for appends
-	idx_t allocation_size;
+	atomic<idx_t> allocation_size;
+	//! Root metadata pointer, if the collection is loaded from disk
+	MetaBlockPointer metadata_pointer;
 };
 
 } // namespace duckdb

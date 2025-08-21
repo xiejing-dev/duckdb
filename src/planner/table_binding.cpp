@@ -73,8 +73,8 @@ BindResult Binding::Bind(ColumnRefExpression &colref, idx_t depth) {
 	binding.table_index = index;
 	binding.column_index = column_index;
 	LogicalType sql_type = types[column_index];
-	if (colref.alias.empty()) {
-		colref.alias = names[column_index];
+	if (colref.GetAlias().empty()) {
+		colref.SetAlias(names[column_index]);
 	}
 	return BindResult(make_uniq<BoundColumnRefExpression>(colref.GetName(), sql_type, binding, depth));
 }
@@ -114,34 +114,41 @@ optional_ptr<StandardEntry> EntryBinding::GetStandardEntry() {
 
 TableBinding::TableBinding(const string &alias, vector<LogicalType> types_p, vector<string> names_p,
                            vector<ColumnIndex> &bound_column_ids, optional_ptr<StandardEntry> entry, idx_t index,
-                           bool add_row_id)
+                           virtual_column_map_t virtual_columns_p)
     : Binding(BindingType::TABLE, GetAlias(alias, entry), std::move(types_p), std::move(names_p), index),
-      bound_column_ids(bound_column_ids), entry(entry) {
-	if (add_row_id) {
-		if (name_map.find("rowid") == name_map.end()) {
-			name_map["rowid"] = COLUMN_IDENTIFIER_ROW_ID;
+      bound_column_ids(bound_column_ids), entry(entry), virtual_columns(std::move(virtual_columns_p)) {
+	for (auto &ventry : virtual_columns) {
+		auto idx = ventry.first;
+		auto &name = ventry.second.name;
+		if (idx < VIRTUAL_COLUMN_START) {
+			throw BinderException(
+			    "Virtual column index must be larger than VIRTUAL_COLUMN_START - found %d for column \"%s\"", idx,
+			    name);
+		}
+		if (idx == COLUMN_IDENTIFIER_EMPTY) {
+			// the empty column cannot be queried by the user
+			continue;
+		}
+		if (name_map.find(name) == name_map.end()) {
+			name_map[name] = idx;
 		}
 	}
 }
 
-static void ReplaceAliases(ParsedExpression &expr, const ColumnList &list,
+static void ReplaceAliases(ParsedExpression &root_expr, const ColumnList &list,
                            const unordered_map<idx_t, string> &alias_map) {
-	if (expr.type == ExpressionType::COLUMN_REF) {
-		auto &colref = expr.Cast<ColumnRefExpression>();
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(root_expr, [&](ColumnRefExpression &colref) {
 		D_ASSERT(!colref.IsQualified());
 		auto &col_names = colref.column_names;
 		D_ASSERT(col_names.size() == 1);
 		auto idx_entry = list.GetColumnIndex(col_names[0]);
 		auto &alias = alias_map.at(idx_entry.index);
 		col_names = {alias};
-	}
-	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](ParsedExpression &child) { ReplaceAliases(child, list, alias_map); });
+	});
 }
 
-static void BakeTableName(ParsedExpression &expr, const BindingAlias &binding_alias) {
-	if (expr.type == ExpressionType::COLUMN_REF) {
-		auto &colref = expr.Cast<ColumnRefExpression>();
+static void BakeTableName(ParsedExpression &root_expr, const BindingAlias &binding_alias) {
+	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(root_expr, [&](ColumnRefExpression &colref) {
 		D_ASSERT(!colref.IsQualified());
 		auto &col_names = colref.column_names;
 		col_names.insert(col_names.begin(), binding_alias.GetAlias());
@@ -151,9 +158,7 @@ static void BakeTableName(ParsedExpression &expr, const BindingAlias &binding_al
 		if (!binding_alias.GetCatalog().empty()) {
 			col_names.insert(col_names.begin(), binding_alias.GetCatalog());
 		}
-	}
-	ParsedExpressionIterator::EnumerateChildren(expr,
-	                                            [&](ParsedExpression &child) { BakeTableName(child, binding_alias); });
+	});
 }
 
 unique_ptr<ParsedExpression> TableBinding::ExpandGeneratedColumn(const string &column_name) {
@@ -226,7 +231,7 @@ BindResult TableBinding::Bind(ColumnRefExpression &colref, idx_t depth) {
 		return BindResult(ColumnNotFoundError(column_name));
 	}
 	auto entry = GetStandardEntry();
-	if (entry && column_index != COLUMN_IDENTIFIER_ROW_ID) {
+	if (entry && !IsVirtualColumn(column_index)) {
 		D_ASSERT(entry->type == CatalogType::TABLE_ENTRY);
 		// Either there is no table, or the columns category has to be standard
 		auto &table_entry = entry->Cast<TableCatalogEntry>();
@@ -237,13 +242,15 @@ BindResult TableBinding::Bind(ColumnRefExpression &colref, idx_t depth) {
 	}
 	// fetch the type of the column
 	LogicalType col_type;
-	if (column_index == COLUMN_IDENTIFIER_ROW_ID) {
-		col_type = LogicalType::ROW_TYPE;
+	auto ventry = virtual_columns.find(column_index);
+	if (ventry != virtual_columns.end()) {
+		// virtual column - fetch type from there
+		col_type = ventry->second.type;
 	} else {
 		// normal column: fetch type from base column
 		col_type = types[column_index];
-		if (colref.alias.empty()) {
-			colref.alias = names[column_index];
+		if (colref.GetAlias().empty()) {
+			colref.SetAlias(names[column_index]);
 		}
 	}
 	ColumnBinding binding = GetColumnBinding(column_index);
@@ -293,7 +300,7 @@ unique_ptr<ParsedExpression> DummyBinding::ParamToArg(ColumnRefExpression &colre
 		throw InternalException("Column %s not found in macro", colref.GetColumnName());
 	}
 	auto arg = (*arguments)[column_index]->Copy();
-	arg->alias = colref.alias;
+	arg->SetAlias(colref.GetAlias());
 	return arg;
 }
 

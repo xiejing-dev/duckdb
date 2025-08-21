@@ -113,7 +113,7 @@ void ExpressionBinder::QualifyColumnNames(unique_ptr<ParsedExpression> &expr,
                                           const bool within_function_expression) {
 
 	bool next_within_function_expression = false;
-	switch (expr->type) {
+	switch (expr->GetExpressionType()) {
 	case ExpressionType::COLUMN_REF: {
 		auto &col_ref = expr->Cast<ColumnRefExpression>();
 
@@ -126,28 +126,28 @@ void ExpressionBinder::QualifyColumnNames(unique_ptr<ParsedExpression> &expr,
 		auto new_expr = QualifyColumnName(col_ref, error);
 
 		if (new_expr) {
-			if (!expr->alias.empty()) {
+			if (!expr->GetAlias().empty()) {
 				// Pre-existing aliases are added to the qualified column reference
-				new_expr->alias = expr->alias;
+				new_expr->SetAlias(expr->GetAlias());
 			} else if (within_function_expression) {
 				// Qualifying the column reference may add an alias, but this needs to be removed within function
 				// expressions, because the alias here means a named parameter instead of a positional parameter
-				new_expr->alias = "";
+				new_expr->ClearAlias();
 			}
 
 			// replace the expression with the qualified column reference
-			new_expr->query_location = col_ref.query_location;
+			new_expr->SetQueryLocation(col_ref.GetQueryLocation());
 			expr = std::move(new_expr);
 		}
 		return;
 	}
 	case ExpressionType::POSITIONAL_REFERENCE: {
 		auto &ref = expr->Cast<PositionalReferenceExpression>();
-		if (ref.alias.empty()) {
+		if (ref.GetAlias().empty()) {
 			string table_name, column_name;
 			auto error = binder.bind_context.BindColumn(ref, table_name, column_name);
 			if (error.empty()) {
-				ref.alias = column_name;
+				ref.SetAlias(column_name);
 			}
 		}
 		break;
@@ -176,7 +176,7 @@ void ExpressionBinder::QualifyColumnNamesInLambda(FunctionExpression &function,
                                                   vector<unordered_set<string>> &lambda_params) {
 
 	for (auto &child : function.children) {
-		if (child->expression_class != ExpressionClass::LAMBDA) {
+		if (child->GetExpressionClass() != ExpressionClass::LAMBDA) {
 			// not a lambda expression
 			QualifyColumnNames(child, lambda_params, true);
 			continue;
@@ -301,32 +301,36 @@ unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnNameWithManyDotsInte
 	// -> 4. resolve "part1" as a column
 
 	// first check if part1 is a catalog
+	ErrorData fully_qualified_error;
 	optional_ptr<Binding> binding;
 	if (col_ref.column_names.size() > 3) {
 		binding = binder.GetMatchingBinding(col_ref.column_names[0], col_ref.column_names[1], col_ref.column_names[2],
-		                                    col_ref.column_names[3], error);
+		                                    col_ref.column_names[3], fully_qualified_error);
 		if (binding) {
 			// part1 is a catalog - the column reference is "catalog.schema.table.column"
 			struct_extract_start = 4;
 			return binder.bind_context.CreateColumnReference(binding->alias, col_ref.column_names[3]);
 		}
 	}
+	ErrorData catalog_table_error;
 	binding = binder.GetMatchingBinding(col_ref.column_names[0], INVALID_SCHEMA, col_ref.column_names[1],
-	                                    col_ref.column_names[2], error);
+	                                    col_ref.column_names[2], catalog_table_error);
 	if (binding) {
 		// part1 is a catalog - the column reference is "catalog.table.column"
 		struct_extract_start = 3;
 		return binder.bind_context.CreateColumnReference(binding->alias, col_ref.column_names[2]);
 	}
-	binding =
-	    binder.GetMatchingBinding(col_ref.column_names[0], col_ref.column_names[1], col_ref.column_names[2], error);
+	ErrorData schema_table_error;
+	binding = binder.GetMatchingBinding(col_ref.column_names[0], col_ref.column_names[1], col_ref.column_names[2],
+	                                    schema_table_error);
 	if (binding) {
 		// part1 is a schema - the column reference is "schema.table.column"
 		// any additional fields are turned into struct_extract calls
 		struct_extract_start = 3;
 		return binder.bind_context.CreateColumnReference(binding->alias, col_ref.column_names[2]);
 	}
-	binding = binder.GetMatchingBinding(col_ref.column_names[0], col_ref.column_names[1], error);
+	ErrorData table_column_error;
+	binding = binder.GetMatchingBinding(col_ref.column_names[0], col_ref.column_names[1], table_column_error);
 	if (binding) {
 		// part1 is a table
 		// the column reference is "table.column"
@@ -335,15 +339,95 @@ unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnNameWithManyDotsInte
 		return binder.bind_context.CreateColumnReference(binding->alias, col_ref.column_names[1]);
 	}
 	// part1 could be a column
-	ErrorData col_error;
-	auto result_expr = QualifyColumnName(col_ref.column_names[0], col_error);
+	ErrorData unused_error;
+	auto result_expr = QualifyColumnName(col_ref.column_names[0], unused_error);
 	if (result_expr) {
 		// it is! add the struct extract calls
 		struct_extract_start = 1;
 		return result_expr;
 	}
-	return CreateStructPack(col_ref);
+	auto struct_pack = CreateStructPack(col_ref);
+	if (struct_pack) {
+		return struct_pack;
+	}
+
+	// we could not find the column - return an error
+	// try to find out which error to return
+	optional_idx catalog_pos;
+	optional_idx schema_pos;
+	optional_idx table_pos;
+	for (const auto &binding_entry : binder.bind_context.GetBindingsList()) {
+		auto &alias = binding_entry->alias;
+		string catalog = alias.GetCatalog();
+		string schema = alias.GetSchema();
+		string table = alias.GetAlias();
+		auto entry = binding_entry->GetStandardEntry();
+		if (entry) {
+			catalog = entry->ParentCatalog().GetName();
+			schema = entry->ParentSchema().name;
+		}
+
+		for (idx_t i = 0; i < 3; i++) {
+			if (catalog == col_ref.column_names[i]) {
+				catalog_pos = i;
+			}
+			if (schema == col_ref.column_names[i]) {
+				schema_pos = i;
+			}
+			if (table == col_ref.column_names[i]) {
+				table_pos = i;
+			}
+		}
+	}
+
+	error = std::move(table_column_error);
+	if (table_pos.IsValid()) {
+		// we have a valid table
+		if (table_pos.GetIndex() == 0) {
+			// the first column is a valid table - return the error as if we were binding the column as the second
+
+		} else if (table_pos.GetIndex() == 1) {
+			// the first column is a valid table
+			// this means either the first column is a catalog OR the first column is a schema
+			if (catalog_pos.IsValid()) {
+				// catalog.table
+				error = std::move(catalog_table_error);
+			} else {
+				// assume schema.table otherwise
+				error = std::move(schema_table_error);
+			}
+		} else if (col_ref.column_names.size() > 3) {
+			// the second column is a valid table
+			// return the fully qualified error if we have enough components
+			error = std::move(fully_qualified_error);
+		}
+	} else if (catalog_pos.IsValid()) {
+		// the first column is a catalog
+		if (schema_pos.IsValid()) {
+			// AND a valid schema - this is likely "catalog.schema.table"
+			if (col_ref.column_names.size() > 3) {
+				error = std::move(fully_qualified_error);
+			} else {
+				error = std::move(catalog_table_error);
+			}
+		} else {
+			// but no valid schema - this could be either "catalog.schema.table" or "catalog.table"
+			// return "catalog.table" for now
+			error = std::move(catalog_table_error);
+		}
+	} else if (schema_pos.IsValid()) {
+		// we did not find a catalog or a table, but we did find a schema
+		if (schema_pos.GetIndex() == 0) {
+			// "schema.table"
+			error = std::move(schema_table_error);
+		} else if (schema_pos.GetIndex() == 1 && col_ref.column_names.size() > 3) {
+			// catalog.schema.table
+			error = std::move(fully_qualified_error);
+		}
+	}
+	return nullptr;
 }
+
 unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnNameWithManyDots(ColumnRefExpression &col_ref,
                                                                              ErrorData &error) {
 	idx_t struct_extract_start = col_ref.column_names.size();
@@ -361,10 +445,9 @@ unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnNameWithManyDots(Col
 }
 
 unique_ptr<ParsedExpression> ExpressionBinder::QualifyColumnName(ColumnRefExpression &col_ref, ErrorData &error) {
-
-	// try binding as a lambda parameter
 	if (!col_ref.IsQualified()) {
-		auto lambda_ref = LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.GetName());
+		// Try binding as a lambda parameter.
+		auto lambda_ref = LambdaRefExpression::FindMatchingBinding(lambda_bindings, col_ref.GetColumnName());
 		if (lambda_ref) {
 			return lambda_ref;
 		}
@@ -421,7 +504,8 @@ BindResult ExpressionBinder::BindExpression(LambdaRefExpression &lambda_ref, idx
 }
 
 BindResult ExpressionBinder::BindExpression(ColumnRefExpression &col_ref_p, idx_t depth, bool root_expression) {
-	if (binder.GetBindingMode() == BindingMode::EXTRACT_NAMES) {
+	if (binder.GetBindingMode() == BindingMode::EXTRACT_NAMES ||
+	    binder.GetBindingMode() == BindingMode::EXTRACT_QUALIFIED_NAMES) {
 		return BindResult(make_uniq<BoundConstantExpression>(Value(LogicalType::SQLNULL)));
 	}
 
@@ -436,27 +520,29 @@ BindResult ExpressionBinder::BindExpression(ColumnRefExpression &col_ref_p, idx_
 			if (found_alias) {
 				return alias_result;
 			}
-
-			// column was not found - check if it is a SQL value function
-			auto value_function = GetSQLValueFunction(col_ref_p.GetColumnName());
-			if (value_function) {
-				return BindExpression(value_function, depth);
+			found_alias = QualifyColumnAlias(col_ref_p);
+			if (!found_alias) {
+				// column was not found - check if it is a SQL value function
+				auto value_function = GetSQLValueFunction(col_ref_p.GetColumnName());
+				if (value_function) {
+					return BindExpression(value_function, depth);
+				}
 			}
 		}
 		error.AddQueryLocation(col_ref_p);
 		return BindResult(std::move(error));
 	}
 
-	expr->query_location = col_ref_p.query_location;
+	expr->SetQueryLocation(col_ref_p.GetQueryLocation());
 
 	// the above QualifyColumName returns a generated expression for a generated
 	// column, and struct_extract for a struct, or a lambda reference expression,
 	// all of them are not column reference expressions, so we return here
-	if (expr->type != ExpressionType::COLUMN_REF) {
-		auto alias = expr->alias;
+	if (expr->GetExpressionType() != ExpressionType::COLUMN_REF) {
+		auto alias = expr->GetAlias();
 		auto result = BindExpression(expr, depth);
 		if (result.expression) {
-			result.expression->alias = std::move(alias);
+			result.expression->SetAlias(std::move(alias));
 		}
 		return result;
 	}
@@ -483,7 +569,7 @@ BindResult ExpressionBinder::BindExpression(ColumnRefExpression &col_ref_p, idx_
 	// we bound the column reference
 	BoundColumnReferenceInfo ref;
 	ref.name = col_ref.column_names.back();
-	ref.query_location = col_ref.query_location;
+	ref.query_location = col_ref.GetQueryLocation();
 	bound_columns.push_back(std::move(ref));
 	return result;
 }

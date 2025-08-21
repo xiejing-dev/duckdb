@@ -27,45 +27,49 @@ struct CSVBufferUsage {
 	idx_t buffer_idx;
 };
 
-//! Class that keeps track of line starts, used for line size verification
-class LinePosition {
-public:
-	LinePosition() {
-	}
-	LinePosition(idx_t buffer_idx_p, idx_t buffer_pos_p, idx_t buffer_size_p)
-	    : buffer_pos(buffer_pos_p), buffer_size(buffer_size_p), buffer_idx(buffer_idx_p) {
-	}
-
-	idx_t operator-(const LinePosition &other) const {
-		if (other.buffer_idx == buffer_idx) {
-			return buffer_pos - other.buffer_pos;
-		}
-		return other.buffer_size - other.buffer_pos + buffer_pos;
-	}
-
-	bool operator==(const LinePosition &other) const {
-		return buffer_pos == other.buffer_pos && buffer_idx == other.buffer_idx && buffer_size == other.buffer_size;
-	}
-
-	idx_t GetGlobalPosition(idx_t requested_buffer_size, bool first_char_nl = false) const {
-		return requested_buffer_size * buffer_idx + buffer_pos + first_char_nl;
-	}
-	idx_t buffer_pos = 0;
-	idx_t buffer_size = 0;
-	idx_t buffer_idx = 0;
-};
-
 //! Keeps track of start and end of line positions in regard to the CSV file
 class FullLinePosition {
 public:
 	FullLinePosition() {};
 	LinePosition begin;
 	LinePosition end;
-
+	static void SanitizeError(string &value);
 	//! Reconstructs the current line to be used in error messages
-	string ReconstructCurrentLine(bool &first_char_nl,
-	                              unordered_map<idx_t, shared_ptr<CSVBufferHandle>> &buffer_handles,
-	                              bool reconstruct_line) const;
+	template <class T>
+	string ReconstructCurrentLine(bool &first_char_nl, T &buffer_handles, bool reconstruct_line) const {
+		if (!reconstruct_line || begin == end) {
+			return {};
+		}
+		string result;
+		if (end.buffer_idx == begin.buffer_idx) {
+			if (buffer_handles.find(end.buffer_idx) == buffer_handles.end()) {
+				return {};
+			}
+			auto buffer = buffer_handles[begin.buffer_idx]->Ptr();
+			first_char_nl = buffer[begin.buffer_pos] == '\n' || buffer[begin.buffer_pos] == '\r';
+			for (idx_t i = begin.buffer_pos + first_char_nl; i < end.buffer_pos; i++) {
+				result += buffer[i];
+			}
+		} else {
+			if (buffer_handles.find(begin.buffer_idx) == buffer_handles.end() ||
+			    buffer_handles.find(end.buffer_idx) == buffer_handles.end()) {
+				return {};
+			}
+			auto first_buffer = buffer_handles[begin.buffer_idx]->Ptr();
+			auto first_buffer_size = buffer_handles[begin.buffer_idx]->actual_size;
+			auto second_buffer = buffer_handles[end.buffer_idx]->Ptr();
+			first_char_nl = first_buffer[begin.buffer_pos] == '\n' || first_buffer[begin.buffer_pos] == '\r';
+			for (idx_t i = begin.buffer_pos + first_char_nl; i < first_buffer_size; i++) {
+				result += first_buffer[i];
+			}
+			for (idx_t i = 0; i < end.buffer_pos; i++) {
+				result += second_buffer[i];
+			}
+		}
+		// sanitize borked line
+		SanitizeError(result);
+		return result;
+	}
 };
 
 class StringValueResult;
@@ -96,7 +100,8 @@ public:
 
 class LineError {
 public:
-	explicit LineError(bool ignore_errors_p) : is_error_in_line(false), ignore_errors(ignore_errors_p) {};
+	explicit LineError(const idx_t scan_id_p, const bool ignore_errors_p)
+	    : is_error_in_line(false), ignore_errors(ignore_errors_p), scan_id(scan_id_p) {};
 	//! We clear up our CurrentError Vector
 	void Reset() {
 		current_errors.clear();
@@ -136,15 +141,20 @@ public:
 		return !current_errors.empty();
 	}
 
+	idx_t Size() const {
+		return current_errors.size();
+	}
+
 private:
 	vector<CurrentError> current_errors;
 	bool is_error_in_line;
 	bool ignore_errors;
+	idx_t scan_id;
 };
 
 struct ParseTypeInfo {
-	ParseTypeInfo() {};
-	ParseTypeInfo(const LogicalType &type, bool validate_utf_8_p) : validate_utf8(validate_utf_8_p) {
+	ParseTypeInfo() : validate_utf8(false), type_id(), internal_type(), scale(0), width(0) {};
+	ParseTypeInfo(const LogicalType &type, const bool validate_utf_8_p) : validate_utf8(validate_utf_8_p) {
 		type_id = type.id();
 		internal_type = type.InternalType();
 		if (type.id() == LogicalTypeId::DECIMAL) {
@@ -159,13 +169,14 @@ struct ParseTypeInfo {
 	uint8_t scale;
 	uint8_t width;
 };
+
 class StringValueResult : public ScannerResult {
 public:
 	StringValueResult(CSVStates &states, CSVStateMachine &state_machine,
 	                  const shared_ptr<CSVBufferHandle> &buffer_handle, Allocator &buffer_allocator,
 	                  idx_t result_size_p, idx_t buffer_position, CSVErrorHandler &error_handler, CSVIterator &iterator,
 	                  bool store_line_size, shared_ptr<CSVFileScan> csv_file_scan, idx_t &lines_read, bool sniffing,
-	                  string path);
+	                  string path, idx_t scan_id);
 
 	~StringValueResult();
 
@@ -174,7 +185,7 @@ public:
 	unsafe_vector<ValidityMask *> validity_mask;
 
 	//! Variables to iterate over the CSV buffers
-	LinePosition last_position;
+
 	char *buffer_ptr;
 	idx_t buffer_size;
 	idx_t position_before_comment;
@@ -206,6 +217,9 @@ public:
 	bool added_last_line = false;
 	bool quoted_new_line = false;
 
+	//! If we are trying a row or not when figuring out the next row to start from.
+	bool try_row = false;
+
 	unsafe_unique_array<ParseTypeInfo> parse_types;
 	vector<string> names;
 
@@ -215,6 +229,8 @@ public:
 	unsafe_unique_array<bool> projected_columns;
 	bool projecting_columns = false;
 	idx_t chunk_col_id = 0;
+
+	bool icu_loaded = false;
 
 	//! We must ensure that we keep the buffers alive until processing the query result
 	unordered_map<idx_t, shared_ptr<CSVBufferHandle>> buffer_handles;
@@ -238,6 +254,8 @@ public:
 	//! (i.e., non-comment) line.
 	bool first_line_is_comment = false;
 
+	bool ignore_empty_values = true;
+
 	//! Specialized code for quoted values, makes sure to remove quotes and escapes
 	static inline void AddQuotedValue(StringValueResult &result, const idx_t buffer_pos);
 	//! Specialized code for possibly escaped values, makes sure to remove escapes
@@ -258,7 +276,7 @@ public:
 	//! Force the throw of a Unicode error
 	void HandleUnicodeError(idx_t col_idx, LinePosition &error_position);
 	bool HandleTooManyColumnsError(const char *value_ptr, const idx_t size);
-	inline void AddValueToVector(const char *value_ptr, const idx_t size, bool allocate = false);
+	inline void AddValueToVector(const char *value_ptr, idx_t size, bool allocate = false);
 	static inline void SetComment(StringValueResult &result, idx_t buffer_pos);
 	static inline bool UnsetComment(StringValueResult &result, idx_t buffer_pos);
 
@@ -310,12 +328,14 @@ public:
 	void Flush(DataChunk &insert_chunk);
 
 	//! Function that creates and returns a non-boundary CSV Scanner, can be used for internal csv reading.
-	static unique_ptr<StringValueScanner> GetCSVScanner(ClientContext &context, CSVReaderOptions &options);
+	static unique_ptr<StringValueScanner> GetCSVScanner(ClientContext &context, CSVReaderOptions &options,
+	                                                    const MultiFileOptions &file_options);
 
 	bool FinishedIterator() const;
 
 	//! Creates a new string with all escaped values removed
-	static string_t RemoveEscape(const char *str_ptr, idx_t end, char escape, Vector &vector);
+	static string_t RemoveEscape(const char *str_ptr, idx_t end, char escape, char quote, bool strict_mode,
+	                             Vector &vector);
 
 	//! If we can directly cast the type when consuming the CSV file, or we have to do it later
 	static bool CanDirectlyCast(const LogicalType &type, bool icu_loaded);
@@ -324,6 +344,8 @@ public:
 	ValidatorLine GetValidationLine();
 
 	const idx_t scanner_idx;
+	//! We use the max of idx_t to signify this is a line finder scanner.
+	static constexpr idx_t LINE_FINDER_ID = NumericLimits<idx_t>::Maximum();
 
 	//! Variable that manages buffer tracking
 	shared_ptr<CSVBufferUsage> buffer_tracker;
@@ -357,7 +379,7 @@ private:
 	idx_t start_pos;
 	//! Pointer to the previous buffer handle, necessary for over-buffer values
 	shared_ptr<CSVBufferHandle> previous_buffer_handle;
-	//! Strict state machine, is basically a state machine with rfc 4180 set to true, used to figure out new line.
+	//! Strict state machine is basically a state machine with rfc 4180 set to true, used to figure out a new line.
 	shared_ptr<CSVStateMachine> state_machine_strict;
 };
 

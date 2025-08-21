@@ -57,7 +57,7 @@ CREATE TABLE test_too_few_rows (a INTEGER, b INTEGER, c VARCHAR, d INTEGER);
 statement error
 COPY test_too_few_rows FROM '__TEST_DIR__/test2.csv' (NULL_PADDING 0);
 ----
-It was not possible to automatically detect the CSV Parsing dialect
+It was not possible to automatically detect the CSV parsing dialect
 
 # create CSV file from query
 query I
@@ -123,9 +123,14 @@ COPY test4 (a,c) FROM '__TEST_DIR__/test4.csv' (SEP 1);
 
 # multiple format options
 statement error
-COPY test4 (a,c) FROM '__TEST_DIR__/test4.csv' (FORMAT 'csv', FORMAT 'json');
+COPY test4 (a,c) FROM '__TEST_DIR__/test4.csv' (FORMAT 'csv', FORMAT 'some_other_copy_function');
 ----
-Copy Function with name "json" is not in the catalog, but it exists in the json extension.
+duplicate option
+
+statement error
+COPY test4 (a,c) FROM '__TEST_DIR__/test4.csv' (FORMAT 'some_other_copy_function', FORMAT 'csv');
+----
+duplicate option
 
 # number as escape string
 statement error
@@ -258,7 +263,7 @@ COPY test FROM 'data/csv/test/test_pipe.csv' (SEPARATOR '|');
 statement error
 COPY test FROM 'data/csv/test/too_many_values.csv';
 ----
-It was not possible to automatically detect the CSV Parsing dialect
+It was not possible to automatically detect the CSV parsing dialect
 
 # test default null string
 query I
@@ -279,7 +284,7 @@ CREATE TABLE empty_table (a INTEGER, b INTEGER, c VARCHAR(10));
 statement error
 COPY empty_table FROM 'data/csv/test/empty.csv' (HEADER 0);
 ----
-It was not possible to automatically detect the CSV Parsing dialect
+It was not possible to automatically detect the CSV parsing dialect
 
 
 # unterminated quotes
@@ -287,7 +292,7 @@ statement ok
 CREATE TABLE unterminated (a VARCHAR);
 
 statement error
-COPY unterminated FROM 'data/csv/test/unterminated.csv' (HEADER 0, AUTO_DETECT FALSE);
+COPY unterminated FROM 'data/csv/test/unterminated.csv' (HEADER 0, AUTO_DETECT FALSE, strict_mode TRUE);
 ----
 Value with unterminated quote found.
 

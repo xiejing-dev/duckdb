@@ -55,6 +55,8 @@ public:
 	//! Replay and initialize the WAL
 	static unique_ptr<WriteAheadLog> Replay(FileSystem &fs, AttachedDatabase &database, const string &wal_path);
 
+	AttachedDatabase &GetDatabase();
+
 	//! Gets the total bytes written to the WAL since startup
 	idx_t GetWALSize() const;
 	//! Gets the total bytes written to the WAL since startup
@@ -66,6 +68,9 @@ public:
 	BufferedFileWriter &Initialize();
 
 	void WriteVersion();
+
+	//! Determines if WAL should be encrypted
+	bool IsEncrypted() const;
 
 	virtual void WriteCreateTable(const TableCatalogEntry &entry);
 	void WriteDropTable(const TableCatalogEntry &entry);

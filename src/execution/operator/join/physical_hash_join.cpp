@@ -17,30 +17,30 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
-#include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/buffer_manager.hpp"
-#include "duckdb/storage/storage_manager.hpp"
 #include "duckdb/storage/temporary_memory_manager.hpp"
+#include "duckdb/main/settings.hpp"
+#include "duckdb/logging/log_manager.hpp"
 
 namespace duckdb {
 
-PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left,
-                                   unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
+PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
+                                   PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
                                    const vector<idx_t> &left_projection_map, const vector<idx_t> &right_projection_map,
                                    vector<LogicalType> delim_types, idx_t estimated_cardinality,
                                    unique_ptr<JoinFilterPushdownInfo> pushdown_info_p)
-    : PhysicalComparisonJoin(op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type, estimated_cardinality),
+    : PhysicalComparisonJoin(physical_plan, op, PhysicalOperatorType::HASH_JOIN, std::move(cond), join_type,
+                             estimated_cardinality),
       delim_types(std::move(delim_types)) {
 
 	filter_pushdown = std::move(pushdown_info_p);
 
-	children.push_back(std::move(left));
-	children.push_back(std::move(right));
+	children.push_back(left);
+	children.push_back(right);
 
 	// Collect condition types, and which conditions are just references (so we won't duplicate them in the payload)
 	unordered_map<idx_t, idx_t> build_columns_in_conditions;
@@ -52,7 +52,7 @@ PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOpera
 		}
 	}
 
-	auto &lhs_input_types = children[0]->GetTypes();
+	auto &lhs_input_types = children[0].get().GetTypes();
 
 	// Create a projection map for the LHS (if it was empty), for convenience
 	lhs_output_columns.col_idxs = left_projection_map;
@@ -73,7 +73,7 @@ PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOpera
 		return;
 	}
 
-	auto &rhs_input_types = children[1]->GetTypes();
+	auto &rhs_input_types = children[1].get().GetTypes();
 
 	// Create a projection map for the RHS (if it was empty), for convenience
 	auto right_projection_map_copy = right_projection_map;
@@ -102,11 +102,11 @@ PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOpera
 	}
 }
 
-PhysicalHashJoin::PhysicalHashJoin(LogicalOperator &op, unique_ptr<PhysicalOperator> left,
-                                   unique_ptr<PhysicalOperator> right, vector<JoinCondition> cond, JoinType join_type,
+PhysicalHashJoin::PhysicalHashJoin(PhysicalPlan &physical_plan, LogicalOperator &op, PhysicalOperator &left,
+                                   PhysicalOperator &right, vector<JoinCondition> cond, JoinType join_type,
                                    idx_t estimated_cardinality)
-    : PhysicalHashJoin(op, std::move(left), std::move(right), std::move(cond), join_type, {}, {}, {},
-                       estimated_cardinality, nullptr) {
+    : PhysicalHashJoin(physical_plan, op, left, right, std::move(cond), join_type, {}, {}, {}, estimated_cardinality,
+                       nullptr) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -137,7 +137,8 @@ public:
 	    : context(context_p), op(op_p),
 	      num_threads(NumericCast<idx_t>(TaskScheduler::GetScheduler(context).NumberOfThreads())),
 	      temporary_memory_state(TemporaryMemoryManager::Get(context).Register(context)), finalized(false),
-	      active_local_states(0), total_size(0), max_partition_size(0), max_partition_count(0), scanned_data(false) {
+	      active_local_states(0), total_size(0), max_partition_size(0), max_partition_count(0),
+	      probe_side_requirement(0), scanned_data(false) {
 		hash_table = op.InitializeHashTable(context);
 
 		// For perfect hash join
@@ -149,9 +150,9 @@ public:
 			                                                               NumericStats::Max(*op.join_stats[1]));
 		}
 		// For external hash join
-		external = ClientConfig::GetConfig(context).GetSetting<DebugForceExternalSetting>(context);
+		external = ClientConfig::GetConfig(context).force_external;
 		// Set probe types
-		probe_types = op.children[0]->types;
+		probe_types = op.children[0].get().GetTypes();
 		probe_types.emplace_back(LogicalType::HASH);
 
 		if (op.filter_pushdown) {
@@ -188,6 +189,7 @@ public:
 	idx_t total_size;
 	idx_t max_partition_size;
 	idx_t max_partition_count;
+	idx_t probe_side_requirement;
 
 	//! Hash tables built by each thread
 	vector<unique_ptr<JoinHashTable>> local_hash_tables;
@@ -249,7 +251,7 @@ public:
 };
 
 unique_ptr<JoinHashTable> PhysicalHashJoin::InitializeHashTable(ClientContext &context) const {
-	auto result = make_uniq<JoinHashTable>(context, conditions, payload_columns.col_types, join_type,
+	auto result = make_uniq<JoinHashTable>(context, *this, conditions, payload_columns.col_types, join_type,
 	                                       rhs_output_columns.col_idxs);
 	if (!delim_types.empty() && join_type == JoinType::MARK) {
 		// correlated MARK join
@@ -372,6 +374,45 @@ SinkCombineResultType PhysicalHashJoin::Combine(ExecutionContext &context, Opera
 //===--------------------------------------------------------------------===//
 // Finalize
 //===--------------------------------------------------------------------===//
+
+static constexpr idx_t PARALLEL_CONSTRUCT_THRESHOLD = 1048576;
+static constexpr double SKEW_SINGLE_THREADED_THRESHOLD = 0.33;
+
+//! If the data is very skewed (many of the exact same key), our finalize will become slow,
+//! due to completely slamming the same atomic using compare-and-swaps.
+//! We can detect this because we partition the data, and go for a single-threaded finalize instead.
+static bool KeysAreSkewed(const HashJoinGlobalSinkState &sink) {
+	const auto max_partition_ht_size =
+	    sink.max_partition_size + sink.hash_table->PointerTableSize(sink.max_partition_count);
+	const auto skew = static_cast<double>(max_partition_ht_size) / static_cast<double>(sink.total_size);
+	return skew > SKEW_SINGLE_THREADED_THRESHOLD;
+}
+
+//! If we have only one thread, always finalize single-threaded. Otherwise, we finalize in parallel if we
+//! have more than 1M rows or if we want to verify parallelism.
+static bool FinalizeSingleThreaded(const HashJoinGlobalSinkState &sink, const bool consider_skew) {
+
+	// if only one thread, finalize single-threaded
+	const auto num_threads = NumericCast<idx_t>(sink.num_threads);
+	if (num_threads == 1) {
+		return true;
+	}
+
+	// if we want to verify parallelism, finalize parallel
+	if (sink.context.config.verify_parallelism) {
+		return false;
+	}
+
+	// finalize single-threaded if we have less than 1M rows
+	const auto &ht = *sink.hash_table;
+	const bool ht_is_small = ht.Count() < PARALLEL_CONSTRUCT_THRESHOLD;
+
+	if (consider_skew) {
+		return ht_is_small || KeysAreSkewed(sink);
+	}
+	return ht_is_small;
+}
+
 static idx_t GetTupleWidth(const vector<LogicalType> &types, bool &all_constant) {
 	idx_t tuple_width = 0;
 	all_constant = true;
@@ -401,13 +442,80 @@ static idx_t GetPartitioningSpaceRequirement(ClientContext &context, const vecto
 
 void PhysicalHashJoin::PrepareFinalize(ClientContext &context, GlobalSinkState &global_state) const {
 	auto &gstate = global_state.Cast<HashJoinGlobalSinkState>();
-	auto &ht = *gstate.hash_table;
+	const auto &ht = *gstate.hash_table;
+
 	gstate.total_size =
 	    ht.GetTotalSize(gstate.local_hash_tables, gstate.max_partition_size, gstate.max_partition_count);
+	gstate.probe_side_requirement =
+	    GetPartitioningSpaceRequirement(context, children[0].get().GetTypes(), ht.GetRadixBits(), gstate.num_threads);
+	const auto max_partition_ht_size =
+	    gstate.max_partition_size + gstate.hash_table->PointerTableSize(gstate.max_partition_count);
+	gstate.temporary_memory_state->SetMinimumReservation(max_partition_ht_size + gstate.probe_side_requirement);
+
 	bool all_constant;
-	gstate.temporary_memory_state->SetMaterializationPenalty(GetTupleWidth(children[0]->types, all_constant));
+	gstate.temporary_memory_state->SetMaterializationPenalty(GetTupleWidth(children[0].get().GetTypes(), all_constant));
 	gstate.temporary_memory_state->SetRemainingSize(gstate.total_size);
 }
+
+class HashJoinTableInitTask : public ExecutorTask {
+public:
+	HashJoinTableInitTask(shared_ptr<Event> event_p, ClientContext &context, HashJoinGlobalSinkState &sink_p,
+	                      idx_t entry_idx_from_p, idx_t entry_idx_to_p, const PhysicalOperator &op_p)
+	    : ExecutorTask(context, std::move(event_p), op_p), sink(sink_p), entry_idx_from(entry_idx_from_p),
+	      entry_idx_to(entry_idx_to_p) {
+	}
+
+	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
+		sink.hash_table->InitializePointerTable(entry_idx_from, entry_idx_to);
+		event->FinishTask();
+		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "HashJoinTableInitTask";
+	}
+
+private:
+	HashJoinGlobalSinkState &sink;
+	idx_t entry_idx_from;
+	idx_t entry_idx_to;
+};
+
+class HashJoinTableInitEvent : public BasePipelineEvent {
+public:
+	HashJoinTableInitEvent(Pipeline &pipeline_p, HashJoinGlobalSinkState &sink)
+	    : BasePipelineEvent(pipeline_p), sink(sink) {
+	}
+
+	HashJoinGlobalSinkState &sink;
+
+public:
+	void Schedule() override {
+		auto &context = pipeline->GetClientContext();
+		vector<shared_ptr<Task>> finalize_tasks;
+		auto &ht = *sink.hash_table;
+		const auto entry_count = ht.capacity;
+		auto num_threads = NumericCast<idx_t>(sink.num_threads);
+
+		// we don't have to check whether it is too skewed here, as we only initialize the pointer table
+		if (FinalizeSingleThreaded(sink, false)) {
+			// Single-threaded memset
+			finalize_tasks.push_back(
+			    make_uniq<HashJoinTableInitTask>(shared_from_this(), context, sink, 0U, entry_count, sink.op));
+		} else {
+			// have 4 times more tasks than threads, but bound the to a minimum
+			const idx_t entries_per_task = MaxValue(entry_count / num_threads / 4, MINIMUM_ENTRIES_PER_TASK);
+			// Parallel memset
+			for (idx_t entry_idx = 0; entry_idx < entry_count; entry_idx += entries_per_task) {
+				auto entry_idx_to = MinValue<idx_t>(entry_idx + entries_per_task, entry_count);
+				finalize_tasks.push_back(make_uniq<HashJoinTableInitTask>(shared_from_this(), context, sink, entry_idx,
+				                                                          entry_idx_to, sink.op));
+			}
+		}
+		SetTasks(std::move(finalize_tasks));
+	}
+	static constexpr const idx_t MINIMUM_ENTRIES_PER_TASK = 131072;
+};
 
 class HashJoinFinalizeTask : public ExecutorTask {
 public:
@@ -421,6 +529,9 @@ public:
 		sink.hash_table->Finalize(chunk_idx_from, chunk_idx_to, parallel);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
+	}
+	string TaskType() const override {
+		return "HashJoinFinalizeTask";
 	}
 
 private:
@@ -445,8 +556,9 @@ public:
 		vector<shared_ptr<Task>> finalize_tasks;
 		auto &ht = *sink.hash_table;
 		const auto chunk_count = ht.GetDataCollection().ChunkCount();
-		const auto num_threads = NumericCast<idx_t>(sink.num_threads);
-		if (num_threads == 1 || (ht.Count() < PARALLEL_CONSTRUCT_THRESHOLD && !context.config.verify_parallelism)) {
+
+		// if the keys are too skewed, we finalize single-threaded
+		if (FinalizeSingleThreaded(sink, true)) {
 			// Single-threaded finalize
 			finalize_tasks.push_back(
 			    make_uniq<HashJoinFinalizeTask>(shared_from_this(), context, sink, 0U, chunk_count, false, sink.op));
@@ -467,7 +579,6 @@ public:
 		sink.hash_table->finalized = true;
 	}
 
-	static constexpr idx_t PARALLEL_CONSTRUCT_THRESHOLD = 1048576;
 	static constexpr idx_t CHUNKS_PER_TASK = 64;
 };
 
@@ -476,9 +587,13 @@ void HashJoinGlobalSinkState::ScheduleFinalize(Pipeline &pipeline, Event &event)
 		hash_table->finalized = true;
 		return;
 	}
-	hash_table->InitializePointerTable();
-	auto new_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, *this);
-	event.InsertEvent(std::move(new_event));
+	hash_table->AllocatePointerTable();
+
+	auto new_init_event = make_shared_ptr<HashJoinTableInitEvent>(pipeline, *this);
+	event.InsertEvent(new_init_event);
+
+	auto new_finalize_event = make_shared_ptr<HashJoinFinalizeEvent>(pipeline, *this);
+	new_init_event->InsertEvent(std::move(new_finalize_event));
 }
 
 void HashJoinGlobalSinkState::InitializeProbeSpill() {
@@ -499,6 +614,10 @@ public:
 		local_ht.Repartition(global_ht);
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
+	}
+
+	string TaskType() const override {
+		return "HashJoinRepartitionTask";
 	}
 
 private:
@@ -567,15 +686,17 @@ public:
 		vector<idx_t> partition_counts(num_partitions, 0);
 		sink.total_size = sink.hash_table->GetTotalSize(partition_sizes, partition_counts, sink.max_partition_size,
 		                                                sink.max_partition_count);
-		const auto probe_side_requirement =
+		sink.probe_side_requirement =
 		    GetPartitioningSpaceRequirement(sink.context, op.types, sink.hash_table->GetRadixBits(), sink.num_threads);
 
 		sink.temporary_memory_state->SetMinimumReservation(sink.max_partition_size +
-		                                                   JoinHashTable::PointerTableSize(sink.max_partition_count) +
-		                                                   probe_side_requirement);
+		                                                   sink.hash_table->PointerTableSize(sink.max_partition_count) +
+		                                                   sink.probe_side_requirement);
 		sink.temporary_memory_state->UpdateReservation(executor.context);
 
-		sink.hash_table->PrepareExternalFinalize(sink.temporary_memory_state->GetReservation());
+		D_ASSERT(sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
+		sink.hash_table->PrepareExternalFinalize(sink.temporary_memory_state->GetReservation() -
+		                                         sink.probe_side_requirement);
 		sink.ScheduleFinalize(*pipeline, *this);
 	}
 };
@@ -597,7 +718,7 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info, 
 	idx_t key_count = ht.FillWithHTOffsets(join_ht_state, tuples_addresses);
 
 	// Scan the build keys in the hash table
-	Vector build_vector(ht.layout.GetTypes()[build_idx], key_count);
+	Vector build_vector(ht.layout_ptr->GetTypes()[build_idx], key_count);
 	data_collection.Gather(tuples_addresses, *FlatVector::IncrementalSelectionVector(), key_count, build_idx,
 	                       build_vector, *FlatVector::IncrementalSelectionVector(), nullptr);
 
@@ -616,16 +737,18 @@ void JoinFilterPushdownInfo::PushInFilter(const JoinFilterPushdownFilter &info, 
 	}
 
 	// generate the OR filter
-	auto or_filter = make_uniq<InFilter>(std::move(in_list));
+	auto in_filter = make_uniq<InFilter>(std::move(in_list));
+
 	// we push the OR filter as an OptionalFilter so that we can use it for zonemap pruning only
 	// the IN-list is expensive to execute otherwise
-	auto filter = make_uniq<OptionalFilter>(std::move(or_filter));
+	auto filter = make_uniq<OptionalFilter>(std::move(in_filter));
 	info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(filter));
+	return;
 }
 
-unique_ptr<DataChunk> JoinFilterPushdownInfo::Finalize(ClientContext &context, JoinHashTable &ht,
+unique_ptr<DataChunk> JoinFilterPushdownInfo::Finalize(ClientContext &context, optional_ptr<JoinHashTable> ht,
                                                        JoinFilterGlobalState &gstate,
-                                                       const PhysicalOperator &op) const {
+                                                       const PhysicalComparisonJoin &op) const {
 	// finalize the min/max aggregates
 	vector<LogicalType> min_max_types;
 	for (auto &aggr_expr : min_max_aggregates) {
@@ -640,9 +763,10 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::Finalize(ClientContext &context, J
 		return final_min_max; // There are not table souces in which we can push down filters
 	}
 
-	auto dynamic_or_filter_threshold = ClientConfig::GetSetting<DynamicOrFilterThresholdSetting>(context);
+	auto dynamic_or_filter_threshold = DBConfig::GetSetting<DynamicOrFilterThresholdSetting>(context);
 	// create a filter for each of the aggregates
 	for (idx_t filter_idx = 0; filter_idx < join_condition.size(); filter_idx++) {
+		const auto cmp = op.conditions[join_condition[filter_idx]].comparison;
 		for (auto &info : probe_info) {
 			auto filter_col_idx = info.columns[filter_idx].probe_column_index.column_index;
 			auto min_idx = filter_idx * 2;
@@ -657,25 +781,47 @@ unique_ptr<DataChunk> JoinFilterPushdownInfo::Finalize(ClientContext &context, J
 				continue;
 			}
 			// if the HT is small we can generate a complete "OR" filter
-			if (ht.Count() > 1 && ht.Count() <= dynamic_or_filter_threshold) {
-				PushInFilter(info, ht, op, filter_idx, filter_col_idx);
+			// but only if the join condition is equality.
+			if (ht && ht->Count() > 1 && ht->Count() <= dynamic_or_filter_threshold &&
+			    cmp == ExpressionType::COMPARE_EQUAL) {
+				PushInFilter(info, *ht, op, filter_idx, filter_col_idx);
 			}
 
 			if (Value::NotDistinctFrom(min_val, max_val)) {
-				// min = max - generate an equality filter
-				auto constant_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, std::move(min_val));
+				// min = max - single value
+				// generate a "one-sided" comparison filter for the LHS
+				// Note that this also works for equalities.
+				auto constant_filter = make_uniq<ConstantFilter>(cmp, std::move(min_val));
 				info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(constant_filter));
 			} else {
 				// min != max - generate a range filter
-				auto greater_equals =
-				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(min_val));
-				info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(greater_equals));
-				auto less_equals =
-				    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(max_val));
-				info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(less_equals));
+				// for non-equalities, the range must be half-open
+				// e.g., for lhs < rhs we can only use lhs <= max
+				switch (cmp) {
+				case ExpressionType::COMPARE_EQUAL:
+				case ExpressionType::COMPARE_GREATERTHAN:
+				case ExpressionType::COMPARE_GREATERTHANOREQUALTO: {
+					auto greater_equals =
+					    make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, std::move(min_val));
+					info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(greater_equals));
+					break;
+				}
+				default:
+					break;
+				}
+				switch (cmp) {
+				case ExpressionType::COMPARE_EQUAL:
+				case ExpressionType::COMPARE_LESSTHAN:
+				case ExpressionType::COMPARE_LESSTHANOREQUALTO: {
+					auto less_equals =
+					    make_uniq<ConstantFilter>(ExpressionType::COMPARE_LESSTHANOREQUALTO, std::move(max_val));
+					info.dynamic_filters->PushFilter(op, filter_col_idx, std::move(less_equals));
+					break;
+				}
+				default:
+					break;
+				}
 			}
-			// not null filter
-			info.dynamic_filters->PushFilter(op, filter_col_idx, make_uniq<IsNotNullFilter>());
 		}
 	}
 
@@ -690,29 +836,55 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	sink.temporary_memory_state->UpdateReservation(context);
 	sink.external = sink.temporary_memory_state->GetReservation() < sink.total_size;
 	if (sink.external) {
+		// For external join we reduce the load factor, this may even prevent the external join altogether
+		ht.load_factor = JoinHashTable::EXTERNAL_LOAD_FACTOR;
+
+		idx_t temp_max_partition_size;
+		idx_t temp_max_partition_count;
+		idx_t temp_total_size =
+		    ht.GetTotalSize(sink.local_hash_tables, temp_max_partition_size, temp_max_partition_count);
+
+		if (temp_total_size < sink.temporary_memory_state->GetReservation()) {
+			// We prevented the external join by reducing the load factor. Update the state accordingly
+			sink.temporary_memory_state->SetMinimumReservation(temp_total_size);
+			sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(context, temp_total_size);
+
+			sink.total_size = temp_total_size;
+			sink.max_partition_size = temp_max_partition_size;
+			sink.max_partition_count = temp_max_partition_count;
+
+			sink.external = false;
+		}
+	}
+	DUCKDB_LOG(context, PhysicalOperatorLogType, *this, "PhysicalHashJoin", "Finalize",
+	           {{"external", to_string(sink.external)}});
+	if (sink.external) {
 		// External Hash Join
 		sink.perfect_join_executor.reset();
 
-		const auto max_partition_ht_size =
-		    sink.max_partition_size + JoinHashTable::PointerTableSize(sink.max_partition_count);
+		const auto max_partition_ht_size = sink.max_partition_size + ht.PointerTableSize(sink.max_partition_count);
 		const auto very_very_skewed = // No point in repartitioning if it's this skewed
 		    static_cast<double>(max_partition_ht_size) >= 0.8 * static_cast<double>(sink.total_size);
-		if (!very_very_skewed && max_partition_ht_size > sink.temporary_memory_state->GetReservation()) {
+		if (!very_very_skewed &&
+		    (max_partition_ht_size + sink.probe_side_requirement) > sink.temporary_memory_state->GetReservation()) {
 			// We have to repartition
+			const auto radix_bits_before = ht.GetRadixBits();
 			ht.SetRepartitionRadixBits(sink.temporary_memory_state->GetReservation(), sink.max_partition_size,
 			                           sink.max_partition_count);
+			DUCKDB_LOG(context, PhysicalOperatorLogType, *this, "PhysicalHashJoin", "Repartition",
+			           {{"partitions_before", to_string(RadixPartitioning::NumberOfPartitions(radix_bits_before))},
+			            {"partitions_after", to_string(RadixPartitioning::NumberOfPartitions(ht.GetRadixBits()))}});
 			auto new_event = make_shared_ptr<HashJoinRepartitionEvent>(pipeline, *this, sink, sink.local_hash_tables);
 			event.InsertEvent(std::move(new_event));
 		} else {
-			// No repartitioning! We do need some space for partitioning the probe-side, though
-			const auto probe_side_requirement =
-			    GetPartitioningSpaceRequirement(context, children[0]->types, ht.GetRadixBits(), sink.num_threads);
-			sink.temporary_memory_state->SetMinimumReservation(max_partition_ht_size + probe_side_requirement);
+			// No repartitioning!
 			for (auto &local_ht : sink.local_hash_tables) {
 				ht.Merge(*local_ht);
 			}
 			sink.local_hash_tables.clear();
-			sink.hash_table->PrepareExternalFinalize(sink.temporary_memory_state->GetReservation());
+			D_ASSERT(sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
+			sink.hash_table->PrepareExternalFinalize(sink.temporary_memory_state->GetReservation() -
+			                                         sink.probe_side_requirement);
 			sink.ScheduleFinalize(pipeline, event);
 		}
 		sink.finalized = true;
@@ -729,7 +901,7 @@ SinkFinalizeType PhysicalHashJoin::Finalize(Pipeline &pipeline, Event &event, Cl
 	Value min;
 	Value max;
 	if (filter_pushdown && !sink.skip_filter_pushdown && ht.Count() > 0) {
-		auto final_min_max = filter_pushdown->Finalize(context, ht, *sink.global_filter_state, *this);
+		auto final_min_max = filter_pushdown->Finalize(context, &ht, *sink.global_filter_state, *this);
 		min = final_min_max->data[0].GetValue(0);
 		max = final_min_max->data[1].GetValue(0);
 	} else if (TypeIsIntegral(conditions[0].right->return_type.InternalType())) {
@@ -986,7 +1158,7 @@ unique_ptr<LocalSourceState> PhysicalHashJoin::GetLocalSourceState(ExecutionCont
 
 HashJoinGlobalSourceState::HashJoinGlobalSourceState(const PhysicalHashJoin &op, const ClientContext &context)
     : op(op), global_stage(HashJoinSourceStage::INIT), build_chunk_count(0), build_chunk_done(0), probe_chunk_count(0),
-      probe_chunk_done(0), probe_count(op.children[0]->estimated_cardinality),
+      probe_chunk_done(0), probe_count(op.children[0].get().estimated_cardinality),
       parallel_scan_chunk_count(context.config.verify_parallelism ? 1 : 120) {
 }
 
@@ -1043,10 +1215,13 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	auto &ht = *sink.hash_table;
 
 	// Update remaining size
-	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize());
+	sink.temporary_memory_state->SetRemainingSizeAndUpdateReservation(sink.context, ht.GetRemainingSize() +
+	                                                                                    sink.probe_side_requirement);
 
 	// Try to put the next partitions in the block collection of the HT
-	if (!sink.external || !ht.PrepareExternalFinalize(sink.temporary_memory_state->GetReservation())) {
+	D_ASSERT(!sink.external || sink.temporary_memory_state->GetReservation() >= sink.probe_side_requirement);
+	if (!sink.external ||
+	    !ht.PrepareExternalFinalize(sink.temporary_memory_state->GetReservation() - sink.probe_side_requirement)) {
 		global_stage = HashJoinSourceStage::DONE;
 		sink.temporary_memory_state->SetZero();
 		return;
@@ -1062,9 +1237,19 @@ void HashJoinGlobalSourceState::PrepareBuild(HashJoinGlobalSinkState &sink) {
 	build_chunk_count = data_collection.ChunkCount();
 	build_chunk_done = 0;
 
-	build_chunks_per_thread = MaxValue<idx_t>((build_chunk_count + sink.num_threads - 1) / sink.num_threads, 1);
+	if (sink.context.config.verify_parallelism) {
+		build_chunks_per_thread = 1;
+	} else {
+		if (KeysAreSkewed(sink)) {
+			build_chunks_per_thread = build_chunk_count; // This forces single-threaded building
+		} else {
+			build_chunks_per_thread = // Same task size as in HashJoinFinalizeEvent
+			    MaxValue<idx_t>(MinValue(build_chunk_count, HashJoinFinalizeEvent::CHUNKS_PER_TASK), 1);
+		}
+	}
 
-	ht.InitializePointerTable();
+	ht.AllocatePointerTable();
+	ht.InitializePointerTable(0, ht.capacity);
 
 	global_stage = HashJoinSourceStage::BUILD;
 }
@@ -1310,22 +1495,20 @@ ProgressData PhysicalHashJoin::GetProgress(ClientContext &context, GlobalSourceS
 		return res;
 	}
 
-	auto num_partitions = static_cast<double>(RadixPartitioning::NumberOfPartitions(sink.hash_table->GetRadixBits()));
-	auto partition_start = static_cast<double>(sink.hash_table->GetPartitionStart());
-	// auto partition_end = static_cast<double>(sink.hash_table->GetPartitionEnd());
+	const auto &ht = *sink.hash_table;
+	const auto num_partitions = static_cast<double>(RadixPartitioning::NumberOfPartitions(ht.GetRadixBits()));
 
-	// This many partitions are fully done
-	res.done = partition_start;
+	res.done = static_cast<double>(ht.FinishedPartitionCount());
 	res.total = num_partitions;
 
-	auto probe_chunk_done = static_cast<double>(gstate.probe_chunk_done);
-	auto probe_chunk_count = static_cast<double>(gstate.probe_chunk_count);
+	const auto probe_chunk_done = static_cast<double>(gstate.probe_chunk_done);
+	const auto probe_chunk_count = static_cast<double>(gstate.probe_chunk_count);
 	if (probe_chunk_count != 0) {
-		// Progress of the current round of probing, weighed by the number of partitions
+		// Progress of the current round of probing
 		auto probe_progress = probe_chunk_done / probe_chunk_count;
-		// Add it to the progress, weighed by the number of partitions in the current round
-		// progress += (partition_end - partition_start) / num_partitions * probe_progress;
-		// TODO also also me, fixup using somehow `partition_end - partition_start`
+		// Weighed by the number of partitions
+		probe_progress *= static_cast<double>(ht.CurrentPartitionCount());
+		// Add it to the progress
 		res.done += probe_progress;
 	}
 

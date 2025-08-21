@@ -21,6 +21,7 @@
 #include "duckdb/main/relation/filter_relation.hpp"
 #include "duckdb_python/expression/pyexpression.hpp"
 #include "duckdb/common/arrow/physical_arrow_collector.hpp"
+#include "duckdb_python/arrow/arrow_export_utils.hpp"
 
 namespace duckdb {
 
@@ -940,11 +941,12 @@ duckdb::pyarrow::Table DuckDBPyRelation::ToArrowTableInternal(idx_t batch_size, 
 		ScopedConfigSetting scoped_setting(
 		    config,
 		    [&batch_size](ClientConfig &config) {
-			    config.result_collector = [&batch_size](ClientContext &context, PreparedStatementData &data) {
+			    config.get_result_collector = [&batch_size](ClientContext &context,
+			                                                PreparedStatementData &data) -> PhysicalOperator & {
 				    return PhysicalArrowCollector::Create(context, data, batch_size);
 			    };
 		    },
-		    [](ClientConfig &config) { config.result_collector = nullptr; });
+		    [](ClientConfig &config) { config.get_result_collector = nullptr; });
 		ExecuteOrThrow();
 	}
 	AssertResultOpen();
@@ -965,12 +967,34 @@ py::object DuckDBPyRelation::ToArrowCapsule(const py::object &requested_schema) 
 		ExecuteOrThrow();
 	}
 	AssertResultOpen();
-	return result->FetchArrowCapsule();
+	auto res = result->FetchArrowCapsule();
+	result = nullptr;
+	return res;
 }
 
-PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size) {
-	auto arrow = ToArrowTableInternal(batch_size, true);
-	return py::cast<PolarsDataFrame>(pybind11::module_::import("polars").attr("DataFrame")(arrow));
+PolarsDataFrame DuckDBPyRelation::ToPolars(idx_t batch_size, bool lazy) {
+	if (!lazy) {
+		auto arrow = ToArrowTableInternal(batch_size, true);
+		return py::cast<PolarsDataFrame>(pybind11::module_::import("polars").attr("DataFrame")(arrow));
+	}
+	auto &import_cache = *DuckDBPyConnection::ImportCache();
+	auto lazy_frame_produce = import_cache.duckdb.polars_io.duckdb_source();
+	//  We also have to get a polars schema here, for this we can get at empty arrow table
+	// We start by extracting the arrow schema
+	ArrowSchema arrow_schema;
+	auto result_names = names;
+	QueryResult::DeduplicateColumns(result_names);
+	auto client_properties = rel->context->GetContext()->GetClientProperties();
+	ArrowConverter::ToArrowSchema(&arrow_schema, types, result_names, client_properties);
+	py::list batches;
+	// Now we create an empty arrow table
+	auto empty_table = pyarrow::ToArrowTable(types, result_names, std::move(batches), client_properties);
+
+	// And we extract the polars schema from the arrow table
+	auto polars_df = py::cast<PolarsDataFrame>(pybind11::module_::import("polars").attr("DataFrame")(empty_table));
+	auto polars_schema = polars_df.attr("schema");
+
+	return lazy_frame_produce(*this, polars_schema);
 }
 
 duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::ToRecordBatch(idx_t batch_size) {
@@ -981,7 +1005,9 @@ duckdb::pyarrow::RecordBatchReader DuckDBPyRelation::ToRecordBatch(idx_t batch_s
 		ExecuteOrThrow(true);
 	}
 	AssertResultOpen();
-	return result->FetchRecordBatchReader(batch_size);
+	auto res = result->FetchRecordBatchReader(batch_size);
+	result = nullptr;
+	return res;
 }
 
 void DuckDBPyRelation::Close() {
@@ -1023,13 +1049,27 @@ unique_ptr<DuckDBPyRelation> DuckDBPyRelation::GetAttribute(const string &name) 
 		throw py::attribute_error(
 		    StringUtil::Format("This relation does not contain a column by the name of '%s'", name));
 	}
+	vector<string> column_names;
 	if (names.size() == 1 && ContainsStructFieldByName(types[0], name)) {
-		return make_uniq<DuckDBPyRelation>(rel->Project({StringUtil::Format("%s.%s", names[0], name)}));
+		// e.g 'rel['my_struct']['my_field']:
+		// first 'my_struct' is selected by the bottom condition
+		// then 'my_field' is accessed on the result of this
+		column_names.push_back(names[0]);
+		column_names.push_back(name);
+	} else if (ContainsColumnByName(name)) {
+		column_names.push_back(name);
 	}
-	if (ContainsColumnByName(name)) {
-		return make_uniq<DuckDBPyRelation>(rel->Project({StringUtil::Format("\"%s\"", name)}));
+
+	if (column_names.empty()) {
+		throw py::attribute_error(
+		    StringUtil::Format("This relation does not contain a column by the name of '%s'", name));
 	}
-	throw py::attribute_error(StringUtil::Format("This relation does not contain a column by the name of '%s'", name));
+
+	vector<unique_ptr<ParsedExpression>> expressions;
+	expressions.push_back(std::move(make_uniq<ColumnRefExpression>(column_names)));
+	vector<string> aliases;
+	aliases.push_back(name);
+	return make_uniq<DuckDBPyRelation>(rel->Project(std::move(expressions), aliases));
 }
 
 unique_ptr<DuckDBPyRelation> DuckDBPyRelation::Union(DuckDBPyRelation *other) {

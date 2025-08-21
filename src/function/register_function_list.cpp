@@ -1,71 +1,54 @@
 #include "duckdb/catalog/default/default_types.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/function/function_list.hpp"
+#include "duckdb/function/register_function_list_helper.hpp"
 #include "duckdb/parser/parsed_data/create_aggregate_function_info.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 namespace duckdb {
 
-static void FillFunctionParameters(FunctionDescription &function_description, const char *function_name,
-                                   vector<string> &parameters, vector<string> &descriptions, vector<string> &examples) {
-	for (string &parameter : parameters) {
-		vector<string> parameter_name_type = StringUtil::Split(parameter, "::");
-		if (parameter_name_type.size() == 1) {
-			function_description.parameter_names.push_back(std::move(parameter_name_type[0]));
-			function_description.parameter_types.push_back(LogicalType::ANY);
-		} else if (parameter_name_type.size() == 2) {
-			function_description.parameter_names.push_back(std::move(parameter_name_type[0]));
-			function_description.parameter_types.push_back(DBConfig::ParseLogicalType(parameter_name_type[1]));
-		} else {
-			throw InternalException("Ill formed function variant for function '%s'", function_name);
-		}
-	}
-}
-
-template <class T>
-void FillFunctionDescriptions(const StaticFunctionDefinition &function, T &info) {
-	vector<string> variants = StringUtil::Split(function.parameters, '\1');
-	vector<string> descriptions = StringUtil::Split(function.description, '\1');
-	vector<string> examples = StringUtil::Split(function.example, '\1');
-
-	// add single variant for functions that take no arguments
-	if (variants.empty()) {
-		variants.push_back("");
+struct MainRegisterContext {
+	MainRegisterContext(Catalog &catalog, CatalogTransaction transaction) : catalog(catalog), transaction(transaction) {
 	}
 
-	for (idx_t variant_index = 0; variant_index < variants.size(); variant_index++) {
-		FunctionDescription function_description;
-		// parameter_names and parameter_types
-		vector<string> parameters = StringUtil::SplitWithParentheses(variants[variant_index], ',');
-		FillFunctionParameters(function_description, function.name, parameters, descriptions, examples);
-		// description
-		if (descriptions.size() == variants.size()) {
-			function_description.description = descriptions[variant_index];
-		} else if (descriptions.size() == 1) {
-			function_description.description = descriptions[0];
-		} else if (!descriptions.empty()) {
-			throw InternalException("Incorrect number of function descriptions for function '%s'", function.name);
-		}
-		// examples
-		if (examples.size() == variants.size()) {
-			function_description.examples = StringUtil::Split(examples[variant_index], '\2');
-		} else if (examples.size() == 1) {
-			function_description.examples = StringUtil::Split(examples[0], '\2');
-		} else if (!examples.empty()) {
-			throw InternalException("Incorrect number of function examples for function '%s'", function.name);
-		}
-		info.descriptions.push_back(std::move(function_description));
-	}
-}
+	Catalog &catalog;
+	CatalogTransaction transaction;
+};
 
-template <class T>
+struct MainRegister {
+	template <class T>
+	static void FillExtraInfo(T &info) {
+	}
+
+	template <class T>
+	static void RegisterFunction(MainRegisterContext &context, T &info) {
+		context.catalog.CreateFunction(context.transaction, info);
+	}
+};
+
+struct ExtensionRegister {
+	template <class T>
+	static void FillExtraInfo(T &info) {
+		info.on_conflict = OnCreateConflict::ALTER_ON_CONFLICT;
+	}
+
+	template <class T>
+	static void RegisterFunction(ExtensionLoader &loader, T &info) {
+		loader.RegisterFunction(std::move(info));
+	}
+};
+
+template <class OP, class T>
 static void FillExtraInfo(const StaticFunctionDefinition &function, T &info) {
 	info.internal = true;
+	info.alias_of = function.alias_of;
 	FillFunctionDescriptions(function, info);
+	OP::FillExtraInfo(info);
 }
 
-static void RegisterFunctionList(Catalog &catalog, CatalogTransaction transaction,
-                                 const StaticFunctionDefinition *functions) {
+template <class OP, class REGISTER_CONTEXT>
+static void RegisterFunctionList(REGISTER_CONTEXT &context, const StaticFunctionDefinition *functions) {
 	for (idx_t i = 0; functions[i].name; i++) {
 		auto &function = functions[i];
 		if (function.get_function || function.get_function_set) {
@@ -78,8 +61,8 @@ static void RegisterFunctionList(Catalog &catalog, CatalogTransaction transactio
 			}
 			result.name = function.name;
 			CreateScalarFunctionInfo info(result);
-			FillExtraInfo(function, info);
-			catalog.CreateFunction(transaction, info);
+			FillExtraInfo<OP>(function, info);
+			OP::RegisterFunction(context, info);
 		} else if (function.get_aggregate_function || function.get_aggregate_function_set) {
 			// aggregate function
 			AggregateFunctionSet result;
@@ -90,16 +73,21 @@ static void RegisterFunctionList(Catalog &catalog, CatalogTransaction transactio
 			}
 			result.name = function.name;
 			CreateAggregateFunctionInfo info(result);
-			FillExtraInfo(function, info);
-			catalog.CreateFunction(transaction, info);
+			FillExtraInfo<OP>(function, info);
+			OP::RegisterFunction(context, info);
 		} else {
 			throw InternalException("Do not know how to register function of this type");
 		}
 	}
 }
 
+void FunctionList::RegisterExtensionFunctions(ExtensionLoader &loader, const StaticFunctionDefinition *functions) {
+	RegisterFunctionList<ExtensionRegister>(loader, functions);
+}
+
 void FunctionList::RegisterFunctions(Catalog &catalog, CatalogTransaction transaction) {
-	RegisterFunctionList(catalog, transaction, FunctionList::GetInternalFunctionList());
+	MainRegisterContext context(catalog, transaction);
+	RegisterFunctionList<MainRegister>(context, FunctionList::GetInternalFunctionList());
 }
 
 } // namespace duckdb

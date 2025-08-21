@@ -18,6 +18,7 @@
 #include "duckdb/planner/expression_binder/base_select_binder.hpp"
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/query_node/bound_select_node.hpp"
+#include "duckdb/main/settings.hpp"
 
 namespace duckdb {
 
@@ -90,7 +91,7 @@ static Value NegatePercentileValue(const Value &v, const bool desc) {
 
 static void NegatePercentileFractions(ClientContext &context, unique_ptr<ParsedExpression> &fractions, bool desc) {
 	D_ASSERT(fractions.get());
-	D_ASSERT(fractions->expression_class == ExpressionClass::BOUND_EXPRESSION);
+	D_ASSERT(fractions->GetExpressionClass() == ExpressionClass::BOUND_EXPRESSION);
 	auto &bound = BoundExpression::GetExpression(*fractions);
 
 	if (!bound->IsFoldable()) {
@@ -139,8 +140,7 @@ BindResult BaseSelectBinder::BindAggregate(FunctionExpression &aggr, AggregateFu
 
 			auto &config = DBConfig::GetConfig(context);
 			const auto &order = aggr.order_bys->orders[0];
-			const auto sense =
-			    (order.type == OrderType::ORDER_DEFAULT) ? config.options.default_order_type : order.type;
+			const auto sense = config.ResolveOrder(context, order.type);
 			negate_fractions = (sense == OrderType::DESCENDING);
 		}
 	}
@@ -157,11 +157,11 @@ BindResult BaseSelectBinder::BindAggregate(FunctionExpression &aggr, AggregateFu
 	// Bind the ORDER BYs, if any
 	if (aggr.order_bys && !aggr.order_bys->orders.empty()) {
 		for (auto &order : aggr.order_bys->orders) {
-			if (order.expression->type == ExpressionType::VALUE_CONSTANT) {
+			if (order.expression->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
 				auto &const_expr = order.expression->Cast<ConstantExpression>();
 				if (!const_expr.value.type().IsIntegral()) {
-					auto &config = ClientConfig::GetConfig(context);
-					if (!config.order_by_non_integer_literal) {
+					auto order_by_non_integer_literal = DBConfig::GetSetting<OrderByNonIntegerLiteralSetting>(context);
+					if (!order_by_non_integer_literal) {
 						throw BinderException(
 						    *order.expression,
 						    "ORDER BY non-integer literal has no effect.\n* SET order_by_non_integer_literal=true to "
@@ -272,8 +272,8 @@ BindResult BaseSelectBinder::BindAggregate(FunctionExpression &aggr, AggregateFu
 		for (auto &order : aggr.order_bys->orders) {
 			auto &order_expr = BoundExpression::GetExpression(*order.expression);
 			PushCollation(context, order_expr, order_expr->return_type);
-			const auto sense = config.ResolveOrder(order.type);
-			const auto null_order = config.ResolveNullOrder(sense, order.null_order);
+			const auto sense = config.ResolveOrder(context, order.type);
+			const auto null_order = config.ResolveNullOrder(context, sense, order.null_order);
 			order_bys->orders.emplace_back(sense, null_order, std::move(order_expr));
 		}
 	}
@@ -313,7 +313,7 @@ BindResult BaseSelectBinder::BindAggregate(FunctionExpression &aggr, AggregateFu
 
 	// now create a column reference referring to the aggregate
 	auto colref = make_uniq<BoundColumnRefExpression>(
-	    aggr.alias.empty() ? node.aggregates[aggr_index]->ToString() : aggr.alias,
+	    aggr.GetAlias().empty() ? node.aggregates[aggr_index]->ToString() : aggr.GetAlias(),
 	    node.aggregates[aggr_index]->return_type, ColumnBinding(node.aggregate_index, aggr_index), depth);
 	// move the aggregate expression into the set of bound aggregates
 	return BindResult(std::move(colref));

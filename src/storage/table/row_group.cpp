@@ -1,28 +1,25 @@
 #include "duckdb/storage/table/row_group.hpp"
-#include "duckdb/common/types/vector.hpp"
+
 #include "duckdb/common/exception.hpp"
-#include "duckdb/storage/table/column_data.hpp"
-#include "duckdb/storage/table/column_checkpoint_state.hpp"
-#include "duckdb/storage/table/update_segment.hpp"
-#include "duckdb/storage/table_storage_info.hpp"
-#include "duckdb/planner/table_filter.hpp"
+#include "duckdb/common/serializer/binary_serializer.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
+#include "duckdb/common/types/vector.hpp"
+#include "duckdb/execution/adaptive_filter.hpp"
 #include "duckdb/execution/expression_executor.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/checkpoint/table_data_writer.hpp"
 #include "duckdb/storage/metadata/metadata_reader.hpp"
-#include "duckdb/transaction/duck_transaction_manager.hpp"
-#include "duckdb/main/database.hpp"
-#include "duckdb/main/attached_database.hpp"
-#include "duckdb/transaction/duck_transaction.hpp"
 #include "duckdb/storage/table/append_state.hpp"
-#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/column_checkpoint_state.hpp"
+#include "duckdb/storage/table/column_data.hpp"
 #include "duckdb/storage/table/row_version_manager.hpp"
-#include "duckdb/common/serializer/serializer.hpp"
-#include "duckdb/common/serializer/deserializer.hpp"
-#include "duckdb/common/serializer/binary_serializer.hpp"
-#include "duckdb/planner/filter/conjunction_filter.hpp"
-#include "duckdb/planner/filter/struct_filter.hpp"
-#include "duckdb/planner/filter/optional_filter.hpp"
-#include "duckdb/execution/adaptive_filter.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/update_segment.hpp"
+#include "duckdb/storage/table_storage_info.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 
 namespace duckdb {
 
@@ -46,6 +43,8 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, RowGroupPointer pointer)
 	}
 	this->deletes_pointers = std::move(pointer.deletes_pointers);
 	this->deletes_is_loaded = false;
+	this->has_metadata_blocks = pointer.has_metadata_blocks;
+	this->extra_metadata_blocks = std::move(pointer.extra_metadata_blocks);
 
 	Verify();
 }
@@ -69,8 +68,16 @@ RowGroup::RowGroup(RowGroupCollection &collection_p, PersistentRowGroupData &dat
 void RowGroup::MoveToCollection(RowGroupCollection &collection_p, idx_t new_start) {
 	this->collection = collection_p;
 	this->start = new_start;
-	for (auto &column : GetColumns()) {
-		column->SetStart(new_start);
+	for (idx_t c = 0; c < columns.size(); c++) {
+		if (is_loaded && !is_loaded[c]) {
+			// we only need to set the column start position if it is already loaded
+			// if it is not loaded - we will set the correct start position upon loading
+			lock_guard<mutex> l(row_group_lock);
+			if (!is_loaded[c]) {
+				continue;
+			}
+		}
+		columns[c]->SetStart(new_start);
 	}
 	if (!HasUnloadedDeletes()) {
 		auto vinfo = GetVersionInfo();
@@ -385,8 +392,9 @@ void RowGroup::CommitDrop() {
 	}
 }
 
-void RowGroup::CommitDropColumn(idx_t column_idx) {
-	GetColumn(column_idx).CommitDropColumn();
+void RowGroup::CommitDropColumn(const idx_t column_index) {
+	auto &column = GetColumn(column_index);
+	column.CommitDropColumn();
 }
 
 void RowGroup::NextVector(CollectionScanState &state) {
@@ -401,7 +409,7 @@ void RowGroup::NextVector(CollectionScanState &state) {
 	}
 }
 
-static FilterPropagateResult CheckRowIdFilter(TableFilter &filter, idx_t beg_row, idx_t end_row) {
+FilterPropagateResult RowGroup::CheckRowIdFilter(const TableFilter &filter, idx_t beg_row, idx_t end_row) {
 	// RowId columns dont have a zonemap, but we can trivially create stats to check the filter against.
 	BaseStatistics dummy_stats = NumericStats::CreateEmpty(LogicalType::ROW_TYPE);
 	NumericStats::SetMin(dummy_stats, UnsafeNumericCast<row_t>(beg_row));
@@ -430,53 +438,16 @@ bool RowGroup::CheckZonemap(ScanFilterInfo &filters) {
 		if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 			return false;
 		}
-		if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
+		if (filter.filter_type == TableFilterType::OPTIONAL_FILTER) {
+			// these are only for row group checking, set as always true so we don't check it
+			filters.SetFilterAlwaysTrue(i);
+		} else if (prune_result == FilterPropagateResult::FILTER_ALWAYS_TRUE) {
 			// filter is always true - no need to check it
 			// label the filter as always true so we don't need to check it anymore
 			filters.SetFilterAlwaysTrue(i);
 		}
 	}
 	return true;
-}
-
-static idx_t GetFilterScanCount(ColumnScanState &state, TableFilter &filter) {
-	switch (filter.filter_type) {
-	case TableFilterType::STRUCT_EXTRACT: {
-		auto &struct_filter = filter.Cast<StructFilter>();
-		auto &child_state = state.child_states[1 + struct_filter.child_idx]; // +1 for validity
-		auto &child_filter = struct_filter.child_filter;
-		return GetFilterScanCount(child_state, *child_filter);
-	}
-	case TableFilterType::CONJUNCTION_AND: {
-		auto &conjunction_state = filter.Cast<ConjunctionAndFilter>();
-		idx_t max_count = 0;
-		for (auto &child_filter : conjunction_state.child_filters) {
-			max_count = std::max(GetFilterScanCount(state, *child_filter), max_count);
-		}
-		return max_count;
-	}
-	case TableFilterType::CONJUNCTION_OR: {
-		auto &conjunction_state = filter.Cast<ConjunctionOrFilter>();
-		idx_t max_count = 0;
-		for (auto &child_filter : conjunction_state.child_filters) {
-			max_count = std::max(GetFilterScanCount(state, *child_filter), max_count);
-		}
-		return max_count;
-	}
-	case TableFilterType::OPTIONAL_FILTER: {
-		auto &zone_filter = filter.Cast<OptionalFilter>();
-		return GetFilterScanCount(state, *zone_filter.child_filter);
-	}
-	case TableFilterType::IS_NULL:
-	case TableFilterType::IS_NOT_NULL:
-	case TableFilterType::CONSTANT_COMPARISON:
-	case TableFilterType::IN_FILTER:
-	case TableFilterType::DYNAMIC_FILTER:
-		return state.current->start + state.current->count;
-	default: {
-		throw NotImplementedException("Unimplemented filter type for zonemap");
-	}
-	}
 }
 
 bool RowGroup::CheckZonemapSegments(CollectionScanState &state) {
@@ -502,7 +473,13 @@ bool RowGroup::CheckZonemapSegments(CollectionScanState &state) {
 		}
 
 		// check zone map segment.
-		idx_t target_row = GetFilterScanCount(state.column_scans[column_idx], filter);
+		auto &column_scan_state = state.column_scans[column_idx];
+		auto current_segment = column_scan_state.current;
+		if (!current_segment) {
+			// no segment to skip
+			continue;
+		}
+		idx_t target_row = current_segment->start + current_segment->count;
 		if (target_row >= state.max_row) {
 			target_row = state.max_row;
 		}
@@ -636,12 +613,13 @@ void RowGroup::TemplatedScan(TransactionData transaction, CollectionScanState &s
 						// this filter is always true - skip it
 						continue;
 					}
+					auto &table_filter_state = *filter.filter_state;
 
 					const auto scan_idx = filter.scan_column_index;
 					const auto column_idx = filter.table_column_index;
 
+					auto &result_vector = result.data[scan_idx];
 					if (column_idx == COLUMN_IDENTIFIER_ROW_ID) {
-
 						// We do another quick statistics scan for row ids here
 						const auto rowid_start = this->start + current_row;
 						const auto rowid_end = this->start + current_row + max_count;
@@ -649,14 +627,14 @@ void RowGroup::TemplatedScan(TransactionData transaction, CollectionScanState &s
 						if (prune_result == FilterPropagateResult::FILTER_ALWAYS_FALSE) {
 							// We can just break out of the loop here.
 							approved_tuple_count = 0;
-							break;
+							continue;
 						}
 
 						// Generate row ids
 						// Create sequence for row ids
-						D_ASSERT(result.data[i].GetType().InternalType() == ROW_TYPE);
-						result.data[i].SetVectorType(VectorType::FLAT_VECTOR);
-						auto result_data = FlatVector::GetData<int64_t>(result.data[i]);
+						D_ASSERT(result_vector.GetType().InternalType() == ROW_TYPE);
+						result_vector.SetVectorType(VectorType::FLAT_VECTOR);
+						auto result_data = FlatVector::GetData<int64_t>(result_vector);
 						for (size_t sel_idx = 0; sel_idx < approved_tuple_count; sel_idx++) {
 							result_data[sel.get_index(sel_idx)] =
 							    UnsafeNumericCast<int64_t>(this->start + current_row + sel.get_index(sel_idx));
@@ -669,14 +647,14 @@ void RowGroup::TemplatedScan(TransactionData transaction, CollectionScanState &s
 
 						// Now apply the filter
 						UnifiedVectorFormat vdata;
-						result.data[i].ToUnifiedFormat(approved_tuple_count, vdata);
-						ColumnSegment::FilterSelection(sel, result.data[i], vdata, filter.filter, approved_tuple_count,
-						                               approved_tuple_count);
+						result_vector.ToUnifiedFormat(approved_tuple_count, vdata);
+						ColumnSegment::FilterSelection(sel, result_vector, vdata, filter.filter, table_filter_state,
+						                               approved_tuple_count, approved_tuple_count);
 
 					} else {
 						auto &col_data = GetColumn(filter.table_column_index);
-						col_data.Select(transaction, state.vector_index, state.column_scans[scan_idx],
-						                result.data[scan_idx], sel, approved_tuple_count, filter.filter);
+						col_data.Filter(transaction, state.vector_index, state.column_scans[scan_idx], result_vector,
+						                sel, approved_tuple_count, filter.filter, table_filter_state);
 					}
 				}
 				for (auto &table_filter : filter_list) {
@@ -723,11 +701,11 @@ void RowGroup::TemplatedScan(TransactionData transaction, CollectionScanState &s
 				} else {
 					auto &col_data = GetColumn(column);
 					if (TYPE == TableScanType::TABLE_SCAN_REGULAR) {
-						col_data.FilterScan(transaction, state.vector_index, state.column_scans[i], result.data[i], sel,
-						                    approved_tuple_count);
+						col_data.Select(transaction, state.vector_index, state.column_scans[i], result.data[i], sel,
+						                approved_tuple_count);
 					} else {
-						col_data.FilterScanCommitted(state.vector_index, state.column_scans[i], result.data[i], sel,
-						                             approved_tuple_count, ALLOW_UPDATES);
+						col_data.SelectCommitted(state.vector_index, state.column_scans[i], result.data[i], sel,
+						                         approved_tuple_count, ALLOW_UPDATES);
 					}
 				}
 			}
@@ -1038,9 +1016,52 @@ bool RowGroup::HasUnloadedDeletes() const {
 	return !deletes_is_loaded;
 }
 
+vector<MetaBlockPointer> RowGroup::GetColumnPointers() {
+	if (has_metadata_blocks) {
+		// we have the column metadata from the file itself - no need to deserialize metadata to fetch it
+		// read if from "column_pointers" and "extra_metadata_blocks"
+		auto result = column_pointers;
+		for (auto &block_pointer : extra_metadata_blocks) {
+			result.emplace_back(block_pointer, 0);
+		}
+		return result;
+	}
+	vector<MetaBlockPointer> result;
+	if (column_pointers.empty()) {
+		// no pointers
+		return result;
+	}
+	// column_pointers stores the beginning of each column
+	// if columns are big - they may span multiple metadata blocks
+	// we need to figure out all blocks that this row group points to
+	// we need to follow the linked list in the metadata blocks to allow for this
+	auto &metadata_manager = GetCollection().GetMetadataManager();
+	idx_t last_idx = column_pointers.size() - 1;
+	if (column_pointers.size() > 1) {
+		// for all but the last column pointer - we can just follow the linked list until we reach the last column
+		MetadataReader reader(metadata_manager, column_pointers[0]);
+		auto last_pointer = column_pointers[last_idx];
+		result = reader.GetRemainingBlocks(last_pointer);
+	}
+	// for the last column we need to deserialize the column - because we don't know where it stops
+	auto &types = GetCollection().GetTypes();
+	MetadataReader reader(metadata_manager, column_pointers[last_idx], &result);
+	ColumnData::Deserialize(GetBlockManager(), GetTableInfo(), last_idx, start, reader, types[last_idx]);
+	return result;
+}
+
 RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
-	vector<CompressionType> compression_types;
-	compression_types.reserve(columns.size());
+	if (!column_pointers.empty() && !HasChanges()) {
+		// we have existing metadata and the row group has not been changed
+		// re-use previous metadata
+		RowGroupWriteData result;
+		result.existing_pointers = GetColumnPointers();
+		return result;
+	}
+	auto &compression_types = writer.GetCompressionTypes();
+	if (columns.size() != compression_types.size()) {
+		throw InternalException("RowGroup::WriteToDisk - mismatch in column count vs compression types");
+	}
 	for (idx_t column_idx = 0; column_idx < GetColumnCount(); column_idx++) {
 		auto &column = GetColumn(column_idx);
 		if (column.count != this->count) {
@@ -1048,7 +1069,6 @@ RowGroupWriteData RowGroup::WriteToDisk(RowGroupWriter &writer) {
 			                        "group has %llu rows, column has %llu)",
 			                        column_idx, this->count.load(), column.count.load());
 		}
-		compression_types.push_back(writer.GetColumnCompressionType(column_idx));
 	}
 
 	RowGroupWriteInfo info(writer.GetPartialBlockManager(), compression_types, writer.GetCheckpointType());
@@ -1059,22 +1079,38 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
                                      TableStatistics &global_stats) {
 	RowGroupPointer row_group_pointer;
 
-	auto lock = global_stats.GetLock();
-	for (idx_t column_idx = 0; column_idx < GetColumnCount(); column_idx++) {
-		global_stats.GetStats(*lock, column_idx).Statistics().Merge(write_data.statistics[column_idx]);
-	}
-
+	auto metadata_manager = writer.GetMetadataManager();
 	// construct the row group pointer and write the column meta data to disk
-	D_ASSERT(write_data.states.size() == columns.size());
 	row_group_pointer.row_start = start;
 	row_group_pointer.tuple_count = count;
+	if (!write_data.existing_pointers.empty()) {
+		// we are re-using the previous metadata
+		row_group_pointer.data_pointers = column_pointers;
+		row_group_pointer.has_metadata_blocks = has_metadata_blocks;
+		row_group_pointer.extra_metadata_blocks = extra_metadata_blocks;
+		row_group_pointer.deletes_pointers = deletes_pointers;
+		metadata_manager->ClearModifiedBlocks(write_data.existing_pointers);
+		metadata_manager->ClearModifiedBlocks(deletes_pointers);
+		return row_group_pointer;
+	}
+	D_ASSERT(write_data.states.size() == columns.size());
+	{
+		auto lock = global_stats.GetLock();
+		for (idx_t column_idx = 0; column_idx < GetColumnCount(); column_idx++) {
+			global_stats.GetStats(*lock, column_idx).Statistics().Merge(write_data.statistics[column_idx]);
+		}
+	}
+	vector<MetaBlockPointer> column_metadata;
+	unordered_set<idx_t> metadata_blocks;
+	writer.StartWritingColumns(column_metadata);
 	for (auto &state : write_data.states) {
 		// get the current position of the table data writer
 		auto &data_writer = writer.GetPayloadWriter();
-		auto pointer = data_writer.GetMetaBlockPointer();
+		auto pointer = writer.GetMetaBlockPointer();
 
 		// store the stats and the data pointers in the row group pointers
 		row_group_pointer.data_pointers.push_back(pointer);
+		metadata_blocks.insert(pointer.block_pointer);
 
 		// Write pointers to the column segments.
 		//
@@ -1086,9 +1122,41 @@ RowGroupPointer RowGroup::Checkpoint(RowGroupWriteData write_data, RowGroupWrite
 		persistent_data.Serialize(serializer);
 		serializer.End();
 	}
-	row_group_pointer.deletes_pointers = CheckpointDeletes(writer.GetPayloadWriter().GetManager());
+	writer.FinishWritingColumns();
+
+	row_group_pointer.has_metadata_blocks = true;
+	for (auto &column_pointer : column_metadata) {
+		auto entry = metadata_blocks.find(column_pointer.block_pointer);
+		if (entry != metadata_blocks.end()) {
+			// this metadata block is already stored in "data_pointers" - no need to duplicate it
+			continue;
+		}
+		// this metadata block is not stored - add it to the extra metadata blocks
+		row_group_pointer.extra_metadata_blocks.push_back(column_pointer.block_pointer);
+	}
+	if (metadata_manager) {
+		row_group_pointer.deletes_pointers = CheckpointDeletes(*metadata_manager);
+	}
 	Verify();
 	return row_group_pointer;
+}
+
+bool RowGroup::HasChanges() const {
+	if (version_info.load()) {
+		// we have deletes
+		return true;
+	}
+	// check if any of the columns have changes
+	// avoid loading unloaded columns - unloaded columns can never have changes
+	for (idx_t c = 0; c < columns.size(); c++) {
+		if (is_loaded && !is_loaded[c]) {
+			continue;
+		}
+		if (columns[c]->HasAnyChanges()) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool RowGroup::IsPersistent() const {
@@ -1132,6 +1200,10 @@ void RowGroup::Serialize(RowGroupPointer &pointer, Serializer &serializer) {
 	serializer.WriteProperty(101, "tuple_count", pointer.tuple_count);
 	serializer.WriteProperty(102, "data_pointers", pointer.data_pointers);
 	serializer.WriteProperty(103, "delete_pointers", pointer.deletes_pointers);
+	if (serializer.ShouldSerialize(6)) {
+		serializer.WriteProperty(104, "has_metadata_blocks", pointer.has_metadata_blocks);
+		serializer.WritePropertyWithDefault(105, "extra_metadata_blocks", pointer.extra_metadata_blocks);
+	}
 }
 
 RowGroupPointer RowGroup::Deserialize(Deserializer &deserializer) {
@@ -1140,6 +1212,24 @@ RowGroupPointer RowGroup::Deserialize(Deserializer &deserializer) {
 	result.tuple_count = deserializer.ReadProperty<uint64_t>(101, "tuple_count");
 	result.data_pointers = deserializer.ReadProperty<vector<MetaBlockPointer>>(102, "data_pointers");
 	result.deletes_pointers = deserializer.ReadProperty<vector<MetaBlockPointer>>(103, "delete_pointers");
+	result.has_metadata_blocks = deserializer.ReadPropertyWithExplicitDefault<bool>(104, "has_metadata_blocks", false);
+	result.extra_metadata_blocks = deserializer.ReadPropertyWithDefault<vector<idx_t>>(105, "extra_metadata_blocks");
+	return result;
+}
+
+//===--------------------------------------------------------------------===//
+// GetPartitionStats
+//===--------------------------------------------------------------------===//
+PartitionStatistics RowGroup::GetPartitionStats() const {
+	PartitionStatistics result;
+	result.row_start = start;
+	result.count = count;
+	if (HasUnloadedDeletes() || version_info.load().get()) {
+		// we have version info - approx count
+		result.count_type = CountType::COUNT_APPROXIMATE;
+	} else {
+		result.count_type = CountType::COUNT_EXACT;
+	}
 	return result;
 }
 

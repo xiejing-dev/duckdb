@@ -17,6 +17,8 @@
 
 namespace duckdb {
 
+namespace {
+
 struct CurrentSequenceValueOperator {
 	static int64_t Operation(DuckTransaction &, SequenceCatalogEntry &seq) {
 		return seq.CurrentValue();
@@ -32,9 +34,8 @@ struct NextSequenceValueOperator {
 SequenceCatalogEntry &BindSequence(Binder &binder, string &catalog, string &schema, const string &name) {
 	// fetch the sequence from the catalog
 	Binder::BindSchemaOrCatalog(binder.context, catalog, schema);
-	return binder.EntryRetriever()
-	    .GetEntry(CatalogType::SEQUENCE_ENTRY, catalog, schema, name)
-	    ->Cast<SequenceCatalogEntry>();
+	EntryLookupInfo sequence_lookup(CatalogType::SEQUENCE_ENTRY, name);
+	return binder.EntryRetriever().GetEntry(catalog, schema, sequence_lookup)->Cast<SequenceCatalogEntry>();
 }
 
 SequenceCatalogEntry &BindSequenceFromContext(ClientContext &context, string &catalog, string &schema,
@@ -70,7 +71,7 @@ unique_ptr<FunctionLocalState> NextValLocalFunction(ExpressionState &state, cons
 }
 
 template <class OP>
-static void NextValFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void NextValFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &func_expr = state.expr.Cast<BoundFunctionExpression>();
 	if (!func_expr.bind_info) {
 		// no bind info - return null
@@ -89,8 +90,11 @@ static void NextValFunction(DataChunk &args, ExpressionState &state, Vector &res
 	}
 }
 
-static unique_ptr<FunctionData> NextValBind(ScalarFunctionBindInput &bind_input, ScalarFunction &,
-                                            vector<unique_ptr<Expression>> &arguments) {
+unique_ptr<FunctionData> NextValBind(ScalarFunctionBindInput &bind_input, ScalarFunction &,
+                                     vector<unique_ptr<Expression>> &arguments) {
+	if (arguments[0]->HasParameter() || arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
 	if (!arguments[0]->IsFoldable()) {
 		throw NotImplementedException(
 		    "currval/nextval requires a constant sequence - non-constant sequences are no longer supported");
@@ -131,6 +135,8 @@ void NextValModifiedDatabases(ClientContext &context, FunctionModifiedDatabasesI
 	input.properties.RegisterDBModify(seq.sequence.ParentCatalog(), context);
 }
 
+} // namespace
+
 ScalarFunction NextvalFun::GetFunction() {
 	ScalarFunction next_val("nextval", {LogicalType::VARCHAR}, LogicalType::BIGINT,
 	                        NextValFunction<NextSequenceValueOperator>, nullptr, nullptr);
@@ -140,6 +146,7 @@ ScalarFunction NextvalFun::GetFunction() {
 	next_val.deserialize = Deserialize;
 	next_val.get_modified_databases = NextValModifiedDatabases;
 	next_val.init_local_state = NextValLocalFunction;
+	BaseScalarFunction::SetReturnsError(next_val);
 	return next_val;
 }
 
@@ -151,6 +158,7 @@ ScalarFunction CurrvalFun::GetFunction() {
 	curr_val.serialize = Serialize;
 	curr_val.deserialize = Deserialize;
 	curr_val.init_local_state = NextValLocalFunction;
+	BaseScalarFunction::SetReturnsError(curr_val);
 	return curr_val;
 }
 

@@ -39,6 +39,8 @@ profiler_settings_t MetricsUtils::GetOptimizerMetrics() {
         MetricsType::OPTIMIZER_EXTENSION,
         MetricsType::OPTIMIZER_MATERIALIZED_CTE,
         MetricsType::OPTIMIZER_SUM_REWRITER,
+        MetricsType::OPTIMIZER_LATE_MATERIALIZATION,
+        MetricsType::OPTIMIZER_CTE_INLINING,
     };
 }
 
@@ -109,6 +111,10 @@ MetricsType MetricsUtils::GetOptimizerMetricByType(OptimizerType type) {
             return MetricsType::OPTIMIZER_MATERIALIZED_CTE;
         case OptimizerType::SUM_REWRITER:
             return MetricsType::OPTIMIZER_SUM_REWRITER;
+        case OptimizerType::LATE_MATERIALIZATION:
+            return MetricsType::OPTIMIZER_LATE_MATERIALIZATION;
+        case OptimizerType::CTE_INLINING:
+            return MetricsType::OPTIMIZER_CTE_INLINING;
        default:
             throw InternalException("OptimizerType %s cannot be converted to a MetricsType", EnumUtil::ToString(type));
     };
@@ -168,6 +174,10 @@ OptimizerType MetricsUtils::GetOptimizerTypeByMetric(MetricsType type) {
             return OptimizerType::MATERIALIZED_CTE;
         case MetricsType::OPTIMIZER_SUM_REWRITER:
             return OptimizerType::SUM_REWRITER;
+        case MetricsType::OPTIMIZER_LATE_MATERIALIZATION:
+            return OptimizerType::LATE_MATERIALIZATION;
+        case MetricsType::OPTIMIZER_CTE_INLINING:
+            return OptimizerType::CTE_INLINING;
     default:
             return OptimizerType::INVALID;
     };
@@ -201,6 +211,8 @@ bool MetricsUtils::IsOptimizerMetric(MetricsType type) {
         case MetricsType::OPTIMIZER_EXTENSION:
         case MetricsType::OPTIMIZER_MATERIALIZED_CTE:
         case MetricsType::OPTIMIZER_SUM_REWRITER:
+        case MetricsType::OPTIMIZER_LATE_MATERIALIZATION:
+        case MetricsType::OPTIMIZER_CTE_INLINING:
             return true;
         default:
             return false;
@@ -217,6 +229,17 @@ bool MetricsUtils::IsPhaseTimingMetric(MetricsType type) {
         case MetricsType::PHYSICAL_PLANNER_COLUMN_BINDING:
         case MetricsType::PHYSICAL_PLANNER_RESOLVE_TYPES:
         case MetricsType::PHYSICAL_PLANNER_CREATE_PLAN:
+            return true;
+        default:
+            return false;
+    };
+}
+
+bool MetricsUtils::IsQueryGlobalMetric(MetricsType type) {
+    switch(type) {
+        case MetricsType::BLOCKED_THREAD_TIME:
+        case MetricsType::SYSTEM_PEAK_BUFFER_MEMORY:
+        case MetricsType::SYSTEM_PEAK_TEMP_DIR_SIZE:
             return true;
         default:
             return false;

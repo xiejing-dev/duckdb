@@ -6,6 +6,8 @@
 
 namespace duckdb {
 
+namespace {
+
 struct NumericRangeInfo {
 	using TYPE = int64_t;
 	using INCREMENT_TYPE = int64_t;
@@ -188,7 +190,7 @@ private:
 };
 
 template <class OP, bool INCLUSIVE_BOUND>
-static void ListRangeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+void ListRangeFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	D_ASSERT(result.GetType().id() == LogicalTypeId::LIST);
 
 	RangeInfoStruct<OP, INCLUSIVE_BOUND> info(args);
@@ -239,6 +241,8 @@ static void ListRangeFunction(DataChunk &args, ExpressionState &state, Vector &r
 	result.Verify(args.size());
 }
 
+} // namespace
+
 ScalarFunctionSet ListRangeFun::GetFunctions() {
 	// the arguments and return types are actually set in the binder function
 	ScalarFunctionSet range_set;
@@ -253,6 +257,9 @@ ScalarFunctionSet ListRangeFun::GetFunctions() {
 	range_set.AddFunction(ScalarFunction({LogicalType::TIMESTAMP, LogicalType::TIMESTAMP, LogicalType::INTERVAL},
 	                                     LogicalType::LIST(LogicalType::TIMESTAMP),
 	                                     ListRangeFunction<TimestampRangeInfo, false>));
+	for (auto &func : range_set.functions) {
+		BaseScalarFunction::SetReturnsError(func);
+	}
 	return range_set;
 }
 
@@ -269,6 +276,9 @@ ScalarFunctionSet GenerateSeriesFun::GetFunctions() {
 	generate_series.AddFunction(ScalarFunction({LogicalType::TIMESTAMP, LogicalType::TIMESTAMP, LogicalType::INTERVAL},
 	                                           LogicalType::LIST(LogicalType::TIMESTAMP),
 	                                           ListRangeFunction<TimestampRangeInfo, true>));
+	for (auto &func : generate_series.functions) {
+		BaseScalarFunction::SetReturnsError(func);
+	}
 	return generate_series;
 }
 

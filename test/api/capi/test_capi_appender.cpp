@@ -30,10 +30,17 @@ public:
 
 } // namespace
 
-void TestAppenderError(duckdb_appender &appender, const string &expected) {
-	auto error = duckdb_appender_error(appender);
-	REQUIRE(error != nullptr);
-	REQUIRE(duckdb::StringUtil::Contains(error, expected));
+void TestAppenderError(duckdb_appender &appender, const duckdb_error_type type, const string &expected) {
+	auto error_data = duckdb_appender_error_data(appender);
+	REQUIRE(error_data != nullptr);
+	REQUIRE(duckdb_error_data_has_error(error_data));
+
+	auto error_type = duckdb_error_data_error_type(error_data);
+	REQUIRE(error_type == type);
+	string error_msg = duckdb_error_data_message(error_data);
+	REQUIRE(duckdb::StringUtil::Contains(error_msg, expected));
+
+	duckdb_destroy_error_data(&error_data);
 }
 
 void AssertDecimalValueMatches(duckdb::unique_ptr<CAPIResult> &result, duckdb_decimal expected) {
@@ -206,11 +213,11 @@ TEST_CASE("Test appender statements in C API", "[capi]") {
 	// Creating the table with an unknown table fails, but creates an appender object.
 	REQUIRE(duckdb_appender_create(tester.connection, nullptr, "unknown_table", &appender) == DuckDBError);
 	REQUIRE(appender != nullptr);
-	TestAppenderError(appender, "could not be found");
+	TestAppenderError(appender, DUCKDB_ERROR_CATALOG, "could not be found");
 
 	// Flushing, closing, or destroying the appender also fails due to its invalid table.
 	REQUIRE(duckdb_appender_close(appender) == DuckDBError);
-	TestAppenderError(appender, "could not be found");
+	TestAppenderError(appender, DUCKDB_ERROR_INVALID, "not a valid appender");
 
 	// Any data is still destroyed, so there are no leaks, even if duckdb_appender_destroy returns DuckDBError.
 	REQUIRE(duckdb_appender_destroy(&appender) == DuckDBError);
@@ -231,7 +238,7 @@ TEST_CASE("Test appender statements in C API", "[capi]") {
 
 	// Exceed the column count.
 	REQUIRE(duckdb_append_int32(appender, 42) == DuckDBError);
-	TestAppenderError(appender, "Too many appends for chunk");
+	TestAppenderError(appender, DUCKDB_ERROR_INVALID_INPUT, "Too many appends for chunk");
 
 	// Finish and flush the row.
 	REQUIRE(duckdb_appender_end_row(appender) == DuckDBSuccess);
@@ -245,7 +252,7 @@ TEST_CASE("Test appender statements in C API", "[capi]") {
 	// Missing column.
 	REQUIRE(duckdb_appender_end_row(appender) == DuckDBError);
 	REQUIRE(duckdb_appender_error(appender) != nullptr);
-	TestAppenderError(appender, "Call to EndRow before all columns have been appended to");
+	TestAppenderError(appender, DUCKDB_ERROR_INVALID_INPUT, "Call to EndRow before all columns have been appended to");
 
 	// Append the missing column.
 	REQUIRE(duckdb_append_varchar(appender, "Hello, World") == DuckDBSuccess);
@@ -717,8 +724,9 @@ TEST_CASE("Test append duckdb_value values in C API", "[capi]") {
 	             "lt30 timetz,"
 	             "lt31 timestamptz,"
 	             // lt34 any - not a valid type in SQL
-	             "lt35 varint," // no duckdb_create_varint (yet)
-	             "lt36 integer" // for sqlnull
+	             "lt35 bignum,"  // no duckdb_create_bignum (yet)
+	             "lt36 integer," // for sqlnull
+	             "lt37 time_ns,"
 	             ")");
 	duckdb_appender appender;
 
@@ -933,14 +941,19 @@ TEST_CASE("Test append duckdb_value values in C API", "[capi]") {
 	REQUIRE(duckdb_append_value(appender, timestamp_tz_value) == DuckDBSuccess);
 	duckdb_destroy_value(&timestamp_tz_value);
 
-	// no duckdb_create_varint (yet)
-	auto null_varint_value = duckdb_create_null_value();
-	REQUIRE(duckdb_append_value(appender, null_varint_value) == DuckDBSuccess);
-	duckdb_destroy_value(&null_varint_value);
+	// no duckdb_create_bignum (yet)
+	auto null_bignum_value = duckdb_create_null_value();
+	REQUIRE(duckdb_append_value(appender, null_bignum_value) == DuckDBSuccess);
+	duckdb_destroy_value(&null_bignum_value);
 
 	auto null_value = duckdb_create_null_value();
 	REQUIRE(duckdb_append_value(appender, null_value) == DuckDBSuccess);
 	duckdb_destroy_value(&null_value);
+
+	duckdb_time_ns time_ns {86400123456789};
+	auto time_ns_value = duckdb_create_time_ns(time_ns);
+	REQUIRE(duckdb_append_value(appender, time_ns_value) == DuckDBSuccess);
+	duckdb_destroy_value(&time_ns_value);
 
 	REQUIRE(duckdb_appender_end_row(appender) == DuckDBSuccess);
 
@@ -1022,9 +1035,12 @@ TEST_CASE("Test append duckdb_value values in C API", "[capi]") {
 	REQUIRE(reinterpret_cast<duckdb_time_tz *>(chunk->GetData(31))[0].bits == time_tz.bits);
 	REQUIRE(reinterpret_cast<duckdb_timestamp *>(chunk->GetData(32))[0].micros == timestamp_tz.micros);
 
-	REQUIRE(duckdb_validity_row_is_valid(chunk->GetValidity(33), 0) == false); // no duckdb_create_varint (yet)
+	REQUIRE(duckdb_validity_row_is_valid(chunk->GetValidity(33), 0) == false); // no duckdb_create_bignum (yet)
 
 	REQUIRE(duckdb_validity_row_is_valid(chunk->GetValidity(34), 0) == false); // sqlnull
+
+	REQUIRE(reinterpret_cast<duckdb_time_ns *>(chunk->GetData(35))[0].nanos == time_ns.nanos);
+
 	tester.Cleanup();
 }
 
@@ -1071,7 +1087,7 @@ TEST_CASE("Test appending with an active column list in the C API") {
 	REQUIRE(duckdb_appender_error(appender) == nullptr);
 
 	REQUIRE(duckdb_appender_add_column(appender, "hello") == DuckDBError);
-	TestAppenderError(appender, "the column must exist in the table");
+	TestAppenderError(appender, DUCKDB_ERROR_INVALID_INPUT, "the column must exist in the table");
 	REQUIRE(duckdb_appender_add_column(appender, "j") == DuckDBSuccess);
 
 	duckdb_logical_type types[1];
@@ -1121,6 +1137,66 @@ TEST_CASE("Test appending with an active column list in the C API") {
 	REQUIRE(result->Fetch<int32_t>(0, 1) == 42);
 	REQUIRE(result->Fetch<int32_t>(1, 1) == 42);
 	REQUIRE(result->Fetch<int32_t>(2, 1) == 42);
+	REQUIRE(result->Fetch<bool>(3, 1) == true);
+
+	tester.Cleanup();
+}
+
+TEST_CASE("Test appending default value to data chunk in the C API") {
+	CAPITester tester;
+	duckdb::unique_ptr<CAPIResult> result;
+	REQUIRE(tester.OpenDatabase(nullptr));
+
+	tester.Query("CREATE OR REPLACE TABLE tbl (i INT DEFAULT 4, j INT, k INT DEFAULT 30, l AS (random()))");
+	duckdb_appender appender;
+
+	auto status = duckdb_appender_create_ext(tester.connection, nullptr, nullptr, "tbl", &appender);
+	REQUIRE(status == DuckDBSuccess);
+	REQUIRE(duckdb_appender_error(appender) == nullptr);
+
+	duckdb_logical_type types[3];
+	types[0] = duckdb_create_logical_type(DUCKDB_TYPE_INTEGER);
+	types[1] = duckdb_create_logical_type(DUCKDB_TYPE_INTEGER);
+	types[2] = duckdb_create_logical_type(DUCKDB_TYPE_INTEGER);
+	auto data_chunk = duckdb_create_data_chunk(types, 3);
+
+	auto col1 = duckdb_data_chunk_get_vector(data_chunk, 0);
+	auto col_data1 = reinterpret_cast<int32_t *>(duckdb_vector_get_data(col1));
+	col_data1[0] = 15;
+	col_data1[1] = 17;
+
+	auto col2 = duckdb_data_chunk_get_vector(data_chunk, 1);
+	auto col_data2 = reinterpret_cast<int32_t *>(duckdb_vector_get_data(col2));
+	col_data2[0] = 16;
+	col_data2[1] = 18;
+
+	REQUIRE(duckdb_append_default_to_chunk(appender, data_chunk, 2, 0) == DuckDBSuccess);
+	REQUIRE(duckdb_append_default_to_chunk(appender, data_chunk, 2, 1) == DuckDBSuccess);
+
+	REQUIRE(duckdb_append_default_to_chunk(appender, data_chunk, 3, 1) == DuckDBError);
+	REQUIRE(duckdb_append_default_to_chunk(appender, data_chunk, 2, duckdb_vector_size() + 1) == DuckDBError);
+
+	duckdb_data_chunk_set_size(data_chunk, 2);
+
+	REQUIRE(duckdb_append_data_chunk(appender, data_chunk) == DuckDBSuccess);
+	duckdb_destroy_data_chunk(&data_chunk);
+	duckdb_destroy_logical_type(&types[0]);
+	duckdb_destroy_logical_type(&types[1]);
+	duckdb_destroy_logical_type(&types[2]);
+
+	REQUIRE(duckdb_appender_flush(appender) == DuckDBSuccess);
+	REQUIRE(duckdb_appender_close(appender) == DuckDBSuccess);
+	REQUIRE(duckdb_appender_destroy(&appender) == DuckDBSuccess);
+
+	result = tester.Query("SELECT i, j, k, l IS NOT NULL FROM tbl");
+	REQUIRE_NO_FAIL(*result);
+	REQUIRE(result->Fetch<int32_t>(0, 0) == 15);
+	REQUIRE(result->Fetch<int32_t>(1, 0) == 16);
+	REQUIRE(result->Fetch<int32_t>(2, 0) == 30);
+	REQUIRE(result->Fetch<bool>(3, 0) == true);
+	REQUIRE(result->Fetch<int32_t>(0, 1) == 17);
+	REQUIRE(result->Fetch<int32_t>(1, 1) == 18);
+	REQUIRE(result->Fetch<int32_t>(2, 1) == 30);
 	REQUIRE(result->Fetch<bool>(3, 1) == true);
 
 	tester.Cleanup();

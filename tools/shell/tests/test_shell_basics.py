@@ -16,7 +16,11 @@ def test_basic(shell):
 
 
 def test_range(shell):
-    test = ShellTest(shell).statement("select * from range(10000)")
+    test = (
+        ShellTest(shell)
+        .statement(".mode csv")
+        .statement("select * from range(10000)")
+    )
     result = test.run()
     result.check_stdout("9999")
 
@@ -182,6 +186,11 @@ def test_exit(shell, alias):
     test = ShellTest(shell).statement(f".{alias}")
     result = test.run()
 
+def test_exit_rc(shell):
+    test = ShellTest(shell).statement(f".exit 17")
+    result = test.run()
+    assert result.status_code == 17
+
 def test_print(shell):
     test = ShellTest(shell).statement(".print asdf")
     result = test.run()
@@ -303,6 +312,13 @@ def test_execute_file(shell, generated_file):
     )
     result = test.run()
     result.check_stdout("42")
+
+def test_execute_non_existent_file(shell):
+    test = (
+        ShellTest(shell, ['-f', '____this_file_does_not_exist'])
+    )
+    result = test.run()
+    result.check_stderr("____this_file_does_not_exist")
 
 @pytest.mark.parametrize('generated_file', ["insert into tbl values (42)"], indirect=True)
 def test_execute_files(shell, generated_file):
@@ -629,6 +645,15 @@ def test_mode_insert(shell):
     result.check_not_exist('3.139999')
     result.check_not_exist('2.710000')
 
+def test_mode_insert_table(shell):
+    test = (
+        ShellTest(shell)
+        .statement(".mode insert my_table")
+        .statement("SELECT 42;")
+    )
+    result = test.run()
+    result.check_stdout('my_table')
+
 def test_mode_line(shell):
     test = (
         ShellTest(shell)
@@ -827,6 +852,17 @@ def test_dump_mixed(shell):
     result = test.run()
     result.check_stdout('CREATE TABLE a(d DATE, k FLOAT, t TIMESTAMP);')
 
+def test_dump_blobs(shell):
+    test = (
+        ShellTest(shell)
+        .statement("create table test(t VARCHAR, b BLOB);")
+        .statement(".changes off")
+        .statement("insert into test values('literal blob', '\\x07\\x08\\x09');")
+        .statement(".dump")
+    )
+    result = test.run()
+    result.check_stdout("'\\x07\\x08\\x09'")
+
 def test_invalid_csv(shell, tmp_path):
     file = tmp_path / 'nonsencsv.csv'
     with open(file, 'wb+') as f:
@@ -861,18 +897,6 @@ def test_mode_trash(shell):
     )
     result = test.run()
     result.check_stdout('')
-
-@pytest.mark.skip(reason="Broken test, ported directly, was commented out")
-def test_dump_blobs(shell):
-    test = (
-        ShellTest(shell)
-        .statement("CREATE TABLE a (b BLOB);")
-        .statement(".changes off")
-        .statement("INSERT INTO a VALUES (DATE '1992-01-01', 0.3, NOW());")
-        .statement(".dump")
-    )
-    result = test.run()
-    result.check_stdout('COMMIT')
 
 def test_sqlite_comments(shell):
     # Using /* <comment> */
@@ -1034,5 +1058,18 @@ def test_decimal_sep(shell):
     result.check_stdout("10,5")
     result.check_stdout("10.5")
     result.check_stdout("current decimal separator")
+
+def test_prepared_statement(shell):
+    test = ShellTest(shell).statement("select ?")
+    result = test.run()
+    result.check_stderr("Prepared statement parameters cannot be used directly")
+
+def test_shell_csv_file(shell):
+    test = (
+        ShellTest(shell, ['data/csv/dates.csv'])
+        .statement('SELECT * FROM dates')
+    )
+    result = test.run()
+    result.check_stdout("2008-08-10")
 
 # fmt: on

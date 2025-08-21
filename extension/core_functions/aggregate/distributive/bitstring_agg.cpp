@@ -13,6 +13,8 @@
 
 namespace duckdb {
 
+namespace {
+
 template <class INPUT_TYPE>
 struct BitAggState {
 	bool is_set;
@@ -234,13 +236,11 @@ idx_t BitStringAggOperation::GetRange(uhugeint_t min, uhugeint_t max) {
 unique_ptr<BaseStatistics> BitstringPropagateStats(ClientContext &context, BoundAggregateExpression &expr,
                                                    AggregateStatisticsInput &input) {
 
-	if (!NumericStats::HasMinMax(input.child_stats[0])) {
-		throw BinderException("Could not retrieve required statistics. Alternatively, try by providing the statistics "
-		                      "explicitly: BITSTRING_AGG(col, min, max) ");
+	if (NumericStats::HasMinMax(input.child_stats[0])) {
+		auto &bind_agg_data = input.bind_data->Cast<BitstringAggBindData>();
+		bind_agg_data.min = NumericStats::Min(input.child_stats[0]);
+		bind_agg_data.max = NumericStats::Max(input.child_stats[0]);
 	}
-	auto &bind_agg_data = input.bind_data->Cast<BitstringAggBindData>();
-	bind_agg_data.min = NumericStats::Min(input.child_stats[0]);
-	bind_agg_data.max = NumericStats::Max(input.child_stats[0]);
 	return nullptr;
 }
 
@@ -260,7 +260,7 @@ unique_ptr<FunctionData> BindBitstringAgg(ClientContext &context, AggregateFunct
 }
 
 template <class TYPE>
-static void BindBitString(AggregateFunctionSet &bitstring_agg, const LogicalTypeId &type) {
+void BindBitString(AggregateFunctionSet &bitstring_agg, const LogicalTypeId &type) {
 	auto function =
 	    AggregateFunction::UnaryAggregateDestructor<BitAggState<TYPE>, TYPE, string_t, BitStringAggOperation>(
 	        type, LogicalType::BIT);
@@ -310,6 +310,8 @@ void GetBitStringAggregate(const LogicalType &type, AggregateFunctionSet &bitstr
 		throw InternalException("Unimplemented bitstring aggregate");
 	}
 }
+
+} // namespace
 
 AggregateFunctionSet BitstringAggFun::GetFunctions() {
 	AggregateFunctionSet bitstring_agg("bitstring_agg");

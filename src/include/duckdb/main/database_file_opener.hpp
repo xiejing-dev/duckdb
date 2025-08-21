@@ -12,6 +12,7 @@
 #include "duckdb/common/opener_file_system.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/logging/log_manager.hpp"
 
 namespace duckdb {
 class DatabaseInstance;
@@ -19,6 +20,10 @@ class DatabaseInstance;
 class DatabaseFileOpener : public FileOpener {
 public:
 	explicit DatabaseFileOpener(DatabaseInstance &db_p) : db(db_p) {
+	}
+
+	Logger &GetLogger() const override {
+		return Logger::Get(db);
 	}
 
 	SettingLookupResult TryGetCurrentSetting(const string &key, Value &result) override {
@@ -31,6 +36,9 @@ public:
 
 	optional_ptr<DatabaseInstance> TryGetDatabase() override {
 		return &db;
+	}
+	shared_ptr<HTTPUtil> &GetHTTPUtil() override {
+		return TryGetDatabase()->config.http_util;
 	}
 
 private:

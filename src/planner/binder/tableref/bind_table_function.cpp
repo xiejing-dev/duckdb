@@ -21,6 +21,10 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 
+#include "duckdb/planner/expression/bound_window_expression.hpp"
+#include "duckdb/planner/operator/logical_window.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
+
 namespace duckdb {
 
 enum class TableFunctionBindType { STANDARD_TABLE_FUNCTION, TABLE_IN_OUT_FUNCTION, TABLE_PARAMETER_FUNCTION };
@@ -53,7 +57,7 @@ static TableFunctionBindType GetTableFunctionBindType(TableFunctionCatalogEntry 
 		}
 		if (function.in_out_function) {
 			has_in_out_function = true;
-		} else if (function.function || function.bind_replace) {
+		} else if (function.function || function.bind_replace || function.bind_operator) {
 			has_standard_table_function = true;
 		} else {
 			throw InternalException("Function \"%s\" has neither in_out_function nor function defined",
@@ -108,25 +112,25 @@ bool Binder::BindTableFunctionParameters(TableFunctionCatalogEntry &table_functi
 		string parameter_name;
 
 		// hack to make named parameters work
-		if (child->type == ExpressionType::COMPARE_EQUAL) {
+		if (child->GetExpressionType() == ExpressionType::COMPARE_EQUAL) {
 			// comparison, check if the LHS is a columnref
 			auto &comp = child->Cast<ComparisonExpression>();
-			if (comp.left->type == ExpressionType::COLUMN_REF) {
+			if (comp.left->GetExpressionType() == ExpressionType::COLUMN_REF) {
 				auto &colref = comp.left->Cast<ColumnRefExpression>();
 				if (!colref.IsQualified()) {
 					parameter_name = colref.GetColumnName();
 					child = std::move(comp.right);
 				}
 			}
-		} else if (!child->alias.empty()) {
+		} else if (!child->GetAlias().empty()) {
 			// <name> => <expression> will set the alias of <expression> to <name>
-			parameter_name = child->alias;
+			parameter_name = child->GetAlias();
 		}
-		if (bind_type == TableFunctionBindType::TABLE_PARAMETER_FUNCTION && child->type == ExpressionType::SUBQUERY) {
+		if (bind_type == TableFunctionBindType::TABLE_PARAMETER_FUNCTION &&
+		    child->GetExpressionType() == ExpressionType::SUBQUERY) {
 			D_ASSERT(table_function.functions.Size() == 1);
 			auto fun = table_function.functions.GetFunctionByOffset(0);
-			if (table_function.functions.Size() != 1 || fun.arguments.empty() ||
-			    fun.arguments[0].id() != LogicalTypeId::TABLE) {
+			if (table_function.functions.Size() != 1 || fun.arguments.empty()) {
 				throw BinderException(
 				    "Only table-in-out functions can have subquery parameters - %s only accepts constant parameters",
 				    fun.name);
@@ -177,7 +181,7 @@ static string GetAlias(const TableFunctionRef &ref) {
 	if (!ref.alias.empty()) {
 		return ref.alias;
 	}
-	if (ref.function && ref.function->type == ExpressionType::FUNCTION) {
+	if (ref.function && ref.function->GetExpressionType() == ExpressionType::FUNCTION) {
 		auto &function_expr = ref.function->Cast<FunctionExpression>();
 		return function_expr.function_name;
 	}
@@ -191,28 +195,80 @@ unique_ptr<LogicalOperator> Binder::BindTableFunctionInternal(TableFunction &tab
                                                               vector<string> input_table_names) {
 	auto function_name = GetAlias(ref);
 	auto &column_name_alias = ref.column_name_alias;
-
 	auto bind_index = GenerateTableIndex();
 	// perform the binding
 	unique_ptr<FunctionData> bind_data;
 	vector<LogicalType> return_types;
 	vector<string> return_names;
-	if (table_function.bind || table_function.bind_replace) {
+	auto constexpr ordinality_name = "ordinality";
+	string ordinality_column_name = ordinality_name;
+	idx_t ordinality_column_id;
+	if (table_function.bind || table_function.bind_replace || table_function.bind_operator) {
 		TableFunctionBindInput bind_input(parameters, named_parameters, input_table_types, input_table_names,
 		                                  table_function.function_info.get(), this, table_function, ref);
-		if (table_function.bind_replace) {
-			auto new_plan = table_function.bind_replace(context, bind_input);
-			if (new_plan != nullptr) {
-				return CreatePlan(*Bind(*new_plan));
-			} else if (!table_function.bind) {
-				throw BinderException("Failed to bind \"%s\": nullptr returned from bind_replace without bind function",
-				                      table_function.name);
+		if (table_function.bind_operator) {
+			auto new_plan = table_function.bind_operator(context, bind_input, bind_index, return_names);
+			if (new_plan) {
+				new_plan->ResolveOperatorTypes();
+				if (new_plan->types.size() != return_names.size()) {
+					throw InternalException("Failed to bind \"%s\": return_types/names must have same size",
+					                        table_function.name);
+				}
+				for (auto &binding : new_plan->GetColumnBindings()) {
+					if (binding.table_index != bind_index) {
+						throw InternalException(
+						    "Failed to bind \"%s\": root bind index must be the passed in bind index",
+						    table_function.name);
+					}
+				}
+				bind_context.AddGenericBinding(bind_index, function_name, return_names, new_plan->types);
+				return new_plan;
 			}
 		}
+		if (table_function.bind_replace) {
+			auto new_plan = table_function.bind_replace(context, bind_input);
+			if (new_plan) {
+				if (!ref.alias.empty()) {
+					new_plan->alias = ref.alias;
+				}
+				if (!ref.column_name_alias.empty()) {
+					new_plan->column_name_alias = ref.column_name_alias;
+				}
+				return CreatePlan(*Bind(*new_plan));
+			}
+		}
+		if (!table_function.bind) {
+			throw BinderException("Failed to bind \"%s\": nullptr returned from bind_replace without bind function",
+			                      table_function.name);
+		}
 		bind_data = table_function.bind(context, bind_input, return_types, return_names);
+		if (ref.with_ordinality == OrdinalityType::WITH_ORDINALITY) {
+			// check if column name 'ordinality' already exists and if so, replace it iteratively until free name is
+			// found
+			case_insensitive_set_t ci_return_names;
+			idx_t ordinality_name_suffix = 0;
+			for (auto &n : return_names) {
+				ci_return_names.insert(n);
+			}
+			for (auto &n : column_name_alias) {
+				ci_return_names.insert(n);
+			}
+			while (ci_return_names.find(ordinality_column_name) != ci_return_names.end()) {
+				ordinality_column_name = ordinality_name + to_string(ordinality_name_suffix++);
+			}
+			if (!correlated_columns.empty()) {
+				return_types.emplace_back(LogicalType::BIGINT);
+				return_names.emplace_back(ordinality_column_name);
+				D_ASSERT(return_names.size() == return_types.size());
+				ordinality_column_id = return_types.size() - 1;
+			}
+		}
 	} else {
 		throw InvalidInputException("Cannot call function \"%s\" directly - it has no bind function",
 		                            table_function.name);
+	}
+	if (bind_data && !bind_data->SupportStatementCache()) {
+		SetAlwaysRequireRebind();
 	}
 	if (return_types.size() != return_names.size()) {
 		throw InternalException("Failed to bind \"%s\": return_types/names must have same size", table_function.name);
@@ -230,20 +286,69 @@ unique_ptr<LogicalOperator> Binder::BindTableFunctionInternal(TableFunction &tab
 			return_names[i] = "C" + to_string(i);
 		}
 	}
+	virtual_column_map_t virtual_columns;
+	if (table_function.get_virtual_columns) {
+		virtual_columns = table_function.get_virtual_columns(context, bind_data.get());
+	}
 
-	auto get = make_uniq<LogicalGet>(bind_index, table_function, std::move(bind_data), return_types, return_names);
+	auto get = make_uniq<LogicalGet>(bind_index, table_function, std::move(bind_data), return_types, return_names,
+	                                 virtual_columns);
 	get->parameters = parameters;
 	get->named_parameters = named_parameters;
 	get->input_table_types = input_table_types;
 	get->input_table_names = input_table_names;
-	if (table_function.in_out_function && !table_function.projection_pushdown) {
+	if (ref.with_ordinality == OrdinalityType::WITH_ORDINALITY && !correlated_columns.empty()) {
+		get->ordinality_idx = ordinality_column_id;
+	}
+	if (table_function.in_out_function) {
 		for (idx_t i = 0; i < return_types.size(); i++) {
 			get->AddColumnId(i);
 		}
 	}
+
+	if (ref.with_ordinality == OrdinalityType::WITH_ORDINALITY && correlated_columns.empty()) {
+		auto window_index = GenerateTableIndex();
+		auto window = make_uniq<duckdb::LogicalWindow>(window_index);
+		auto row_number =
+		    make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT, nullptr, nullptr);
+		row_number->start = WindowBoundary::UNBOUNDED_PRECEDING;
+		row_number->end = WindowBoundary::CURRENT_ROW_ROWS;
+		if (return_names.size() < column_name_alias.size()) {
+			row_number->alias = column_name_alias[return_names.size()];
+		} else {
+			row_number->alias = ordinality_column_name;
+		}
+		window->expressions.push_back(std::move(row_number));
+		for (idx_t i = 0; i < return_types.size(); i++) {
+			get->AddColumnId(i);
+		}
+		window->children.push_back(std::move(get));
+
+		vector<unique_ptr<Expression>> select_list;
+		for (idx_t i = 0; i < return_types.size(); i++) {
+			auto expression = make_uniq<BoundColumnRefExpression>(return_types[i], ColumnBinding(bind_index, i));
+			select_list.push_back(std::move(expression));
+		}
+		select_list.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::BIGINT, ColumnBinding(window_index, 0)));
+
+		auto projection_index = GenerateTableIndex();
+		auto projection = make_uniq<LogicalProjection>(projection_index, std::move(select_list));
+
+		projection->children.push_back(std::move(window));
+		if (return_names.size() < column_name_alias.size()) {
+			return_names.push_back(column_name_alias[return_names.size()]);
+		} else {
+			return_names.push_back(ordinality_column_name);
+		}
+
+		return_types.push_back(LogicalType::BIGINT);
+		bind_context.AddGenericBinding(projection_index, function_name, return_names, return_types);
+		return std::move(projection);
+	}
+
 	// now add the table function to the bind context so its columns can be bound
 	bind_context.AddTableFunction(bind_index, function_name, return_names, return_types, get->GetMutableColumnIds(),
-	                              get->GetTable().get());
+	                              get->GetTable().get(), std::move(virtual_columns));
 	return std::move(get);
 }
 
@@ -262,7 +367,7 @@ unique_ptr<LogicalOperator> Binder::BindTableFunction(TableFunction &function, v
 unique_ptr<BoundTableRef> Binder::Bind(TableFunctionRef &ref) {
 	QueryErrorContext error_context(ref.query_location);
 
-	D_ASSERT(ref.function->type == ExpressionType::FUNCTION);
+	D_ASSERT(ref.function->GetExpressionType() == ExpressionType::FUNCTION);
 	auto &fexpr = ref.function->Cast<FunctionExpression>();
 
 	string catalog = fexpr.catalog;
@@ -270,8 +375,9 @@ unique_ptr<BoundTableRef> Binder::Bind(TableFunctionRef &ref) {
 	Binder::BindSchemaOrCatalog(context, catalog, schema);
 
 	// fetch the function from the catalog
-	auto &func_catalog = *GetCatalogEntry(CatalogType::TABLE_FUNCTION_ENTRY, catalog, schema, fexpr.function_name,
-	                                      OnEntryNotFound::THROW_EXCEPTION, error_context);
+
+	EntryLookupInfo table_function_lookup(CatalogType::TABLE_FUNCTION_ENTRY, fexpr.function_name, error_context);
+	auto &func_catalog = *GetCatalogEntry(catalog, schema, table_function_lookup, OnEntryNotFound::THROW_EXCEPTION);
 
 	if (func_catalog.type == CatalogType::TABLE_MACRO_ENTRY) {
 		auto &macro_func = func_catalog.Cast<TableMacroCatalogEntry>();
@@ -282,7 +388,14 @@ unique_ptr<BoundTableRef> Binder::Bind(TableFunctionRef &ref) {
 		binder->can_contain_nulls = true;
 
 		binder->alias = ref.alias.empty() ? "unnamed_query" : ref.alias;
-		auto query = binder->BindNode(*query_node);
+		unique_ptr<BoundQueryNode> query;
+		try {
+			query = binder->BindNode(*query_node);
+		} catch (std::exception &ex) {
+			ErrorData error(ex);
+			error.AddQueryLocation(ref);
+			error.Throw();
+		}
 
 		idx_t bind_index = query->GetRootIndex();
 		// string alias;

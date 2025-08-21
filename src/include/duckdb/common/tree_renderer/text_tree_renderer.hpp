@@ -37,6 +37,10 @@ struct TextTreeRendererConfig {
 	idx_t max_extra_lines = 30;
 	bool detailed = false;
 
+	// Formatting options
+	char thousand_separator = ',';
+	char decimal_separator = '.';
+
 #ifndef DUCKDB_ASCII_TREE_RENDERER
 	const char *LTCORNER = "\342\224\214"; // NOLINT "┌";
 	const char *RTCORNER = "\342\224\220"; // NOLINT "┐";
@@ -112,8 +116,10 @@ private:
 	bool CanSplitOnThisChar(char l);
 	bool IsPadding(char l);
 	string RemovePadding(string l);
-	void SplitUpExtraInfo(const InsertionOrderPreservingMap<string> &extra_info, vector<string> &result);
+	void SplitUpExtraInfo(const InsertionOrderPreservingMap<string> &extra_info, vector<string> &result,
+	                      idx_t max_lines);
 	void SplitStringBuffer(const string &source, vector<string> &result);
+	string FormatNumber(const string &input);
 };
 
 } // namespace duckdb

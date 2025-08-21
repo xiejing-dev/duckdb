@@ -58,21 +58,21 @@ static unique_ptr<FunctionData> StructInsertBind(ClientContext &context, ScalarF
 	// Loop through the additional arguments (name/value pairs)
 	for (idx_t i = 1; i < arguments.size(); i++) {
 		auto &child = arguments[i];
-		if (child->alias.empty()) {
+		if (child->GetAlias().empty()) {
 			throw BinderException("Need named argument for struct insert, e.g., a := b");
 		}
-		if (name_collision_set.find(child->alias) != name_collision_set.end()) {
-			throw BinderException("Duplicate struct entry name \"%s\"", child->alias);
+		if (name_collision_set.find(child->GetAlias()) != name_collision_set.end()) {
+			throw BinderException("Duplicate struct entry name \"%s\"", child->GetAlias());
 		}
-		name_collision_set.insert(child->alias);
-		new_children.push_back(make_pair(child->alias, arguments[i]->return_type));
+		name_collision_set.insert(child->GetAlias());
+		new_children.push_back(make_pair(child->GetAlias(), arguments[i]->return_type));
 	}
 
 	bound_function.return_type = LogicalType::STRUCT(new_children);
 	return make_uniq<VariableReturnBindData>(bound_function.return_type);
 }
 
-unique_ptr<BaseStatistics> StructInsertStats(ClientContext &context, FunctionStatisticsInput &input) {
+static unique_ptr<BaseStatistics> StructInsertStats(ClientContext &context, FunctionStatisticsInput &input) {
 	auto &child_stats = input.child_stats;
 	auto &expr = input.expr;
 	auto new_stats = StructStats::CreateUnknown(expr.return_type);

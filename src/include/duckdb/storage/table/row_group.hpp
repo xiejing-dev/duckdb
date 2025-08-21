@@ -19,6 +19,7 @@
 #include "duckdb/storage/block.hpp"
 #include "duckdb/common/enums/checkpoint_type.hpp"
 #include "duckdb/storage/storage_index.hpp"
+#include "duckdb/function/partition_stats.hpp"
 
 namespace duckdb {
 class AttachedDatabase;
@@ -41,6 +42,7 @@ struct PersistentRowGroupData;
 struct RowGroupPointer;
 struct TransactionData;
 class CollectionScanState;
+class TableFilter;
 class TableFilterSet;
 struct ColumnFetchState;
 struct RowGroupAppendState;
@@ -63,6 +65,7 @@ struct RowGroupWriteInfo {
 struct RowGroupWriteData {
 	vector<unique_ptr<ColumnCheckpointState>> states;
 	vector<BaseStatistics> statistics;
+	vector<MetaBlockPointer> existing_pointers;
 };
 
 class RowGroup : public SegmentBase<RowGroup> {
@@ -90,6 +93,12 @@ public:
 	RowGroupCollection &GetCollection() {
 		return collection.get();
 	}
+	//! Returns the list of meta block pointers used by the columns
+	vector<MetaBlockPointer> GetColumnPointers();
+	//! Returns the list of meta block pointers used by the deletes
+	const vector<MetaBlockPointer> &GetDeletesPointers() const {
+		return deletes_pointers;
+	}
 	BlockManager &GetBlockManager();
 	DataTableInfo &GetTableInfo();
 
@@ -101,9 +110,10 @@ public:
 	unique_ptr<RowGroup> RemoveColumn(RowGroupCollection &collection, idx_t removed_column);
 
 	void CommitDrop();
-	void CommitDropColumn(idx_t index);
+	void CommitDropColumn(const idx_t column_index);
 
 	void InitializeEmpty(const vector<LogicalType> &types);
+	bool HasChanges() const;
 
 	//! Initialize a scan over this row_group
 	bool InitializeScan(CollectionScanState &state);
@@ -163,6 +173,7 @@ public:
 	unique_ptr<BaseStatistics> GetStatistics(idx_t column_idx);
 
 	void GetColumnSegmentInfo(idx_t row_group_index, vector<ColumnSegmentInfo> &result);
+	PartitionStatistics GetPartitionStats() const;
 
 	idx_t GetAllocationSize() const {
 		return allocation_size;
@@ -180,6 +191,8 @@ public:
 	static RowGroupPointer Deserialize(Deserializer &deserializer);
 
 	idx_t GetRowGroupSize() const;
+
+	static FilterPropagateResult CheckRowIdFilter(const TableFilter &filter, idx_t beg_row, idx_t end_row);
 
 private:
 	optional_ptr<RowVersionManager> GetVersionInfo();
@@ -204,8 +217,10 @@ private:
 	vector<MetaBlockPointer> column_pointers;
 	unique_ptr<atomic<bool>[]> is_loaded;
 	vector<MetaBlockPointer> deletes_pointers;
+	bool has_metadata_blocks = false;
+	vector<idx_t> extra_metadata_blocks;
 	atomic<bool> deletes_is_loaded;
-	idx_t allocation_size;
+	atomic<idx_t> allocation_size;
 };
 
 } // namespace duckdb

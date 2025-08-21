@@ -28,7 +28,7 @@ void ParsedExpressionIterator::EnumerateChildren(ParsedExpression &expr,
 
 void ParsedExpressionIterator::EnumerateChildren(
     ParsedExpression &expr, const std::function<void(unique_ptr<ParsedExpression> &child)> &callback) {
-	switch (expr.expression_class) {
+	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BETWEEN: {
 		auto &cast_expr = expr.Cast<BetweenExpression>();
 		callback(cast_expr.input);
@@ -139,6 +139,9 @@ void ParsedExpressionIterator::EnumerateChildren(
 		}
 		if (window_expr.default_expr) {
 			callback(window_expr.default_expr);
+		}
+		for (auto &order : window_expr.arg_orders) {
+			callback(order.expression);
 		}
 		break;
 	}
@@ -252,6 +255,7 @@ void ParsedExpressionIterator::EnumerateTableRefChildren(
 		break;
 	case TableReferenceType::INVALID:
 	case TableReferenceType::CTE:
+	case TableReferenceType::BOUND_TABLE_REF:
 		throw NotImplementedException("TableRef type not implemented for traversal");
 	}
 	ref_callback(ref);
@@ -311,6 +315,27 @@ void ParsedExpressionIterator::EnumerateQueryNodeChildren(
 	for (auto &kv : node.cte_map.map) {
 		EnumerateQueryNodeChildren(*kv.second->query->node, expr_callback, ref_callback);
 	}
+}
+
+void ParsedExpressionIterator::VisitExpressionClass(
+    const ParsedExpression &expr, ExpressionClass expr_class,
+    const std::function<void(const ParsedExpression &child)> &callback) {
+	if (expr.GetExpressionClass() == expr_class) {
+		callback(expr);
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](const ParsedExpression &child) { VisitExpressionClass(child, expr_class, callback); });
+}
+
+void ParsedExpressionIterator::VisitExpressionClassMutable(
+    ParsedExpression &expr, ExpressionClass expr_class, const std::function<void(ParsedExpression &child)> &callback) {
+	if (expr.GetExpressionClass() == expr_class) {
+		callback(expr);
+		return;
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expr, [&](ParsedExpression &child) { VisitExpressionClassMutable(child, expr_class, callback); });
 }
 
 } // namespace duckdb

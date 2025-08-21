@@ -1,4 +1,3 @@
-#include "duckdb/execution/expression_executor.hpp"
 #include "core_functions/aggregate/holistic_functions.hpp"
 #include "duckdb/planner/expression.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
@@ -6,6 +5,8 @@
 #include "core_functions/aggregate/quantile_state.hpp"
 
 namespace duckdb {
+
+namespace {
 
 struct FrameSet {
 	inline explicit FrameSet(const SubFrames &frames_p) : frames(frames_p) {
@@ -182,7 +183,7 @@ struct MedianAbsoluteDeviationOperation : QuantileOperation {
 		auto &bind_data = finalize_data.input.bind_data->Cast<QuantileBindData>();
 		D_ASSERT(bind_data.quantiles.size() == 1);
 		const auto &q = bind_data.quantiles[0];
-		Interpolator<false> interp(q, state.v.size(), false);
+		QuantileInterpolator<false> interp(q, state.v.size(), false);
 		const auto med = interp.template Operation<INPUT_TYPE, MEDIAN_TYPE>(state.v.data(), finalize_data.result);
 
 		MadAccessor<INPUT_TYPE, T, MEDIAN_TYPE> accessor(med);
@@ -218,7 +219,7 @@ struct MedianAbsoluteDeviationOperation : QuantileOperation {
 		const auto &quantile = bind_data.quantiles[0];
 		auto &window_state = state.GetOrCreateWindowState();
 		MEDIAN_TYPE med;
-		if (gstate && gstate->HasTrees()) {
+		if (gstate && gstate->HasTree()) {
 			med = gstate->GetWindowState().template WindowScalar<MEDIAN_TYPE, false>(data, frames, n, result, quantile);
 		} else {
 			window_state.UpdateSkip(data, frames, included);
@@ -237,7 +238,7 @@ struct MedianAbsoluteDeviationOperation : QuantileOperation {
 		ReuseIndexes(index2, frames, prevs);
 		std::partition(index2, index2 + window_state.count, included);
 
-		Interpolator<false> interp(quantile, n, false);
+		QuantileInterpolator<false> interp(quantile, n, false);
 
 		// Compute mad from the second index
 		using ID = QuantileIndirect<INPUT_TYPE>;
@@ -276,7 +277,7 @@ AggregateFunction GetTypedMedianAbsoluteDeviationAggregateFunction(const Logical
 	return fun;
 }
 
-AggregateFunction GetMedianAbsoluteDeviationAggregateFunction(const LogicalType &type) {
+AggregateFunction GetMedianAbsoluteDeviationAggregateFunctionInternal(const LogicalType &type) {
 	switch (type.id()) {
 	case LogicalTypeId::FLOAT:
 		return GetTypedMedianAbsoluteDeviationAggregateFunction<float, float, float>(type, type);
@@ -314,6 +315,12 @@ AggregateFunction GetMedianAbsoluteDeviationAggregateFunction(const LogicalType 
 	}
 }
 
+AggregateFunction GetMedianAbsoluteDeviationAggregateFunction(const LogicalType &type) {
+	auto result = GetMedianAbsoluteDeviationAggregateFunctionInternal(type);
+	result.errors = FunctionErrors::CAN_THROW_RUNTIME_ERROR;
+	return result;
+}
+
 unique_ptr<FunctionData> BindMedianAbsoluteDeviationDecimal(ClientContext &context, AggregateFunction &function,
                                                             vector<unique_ptr<Expression>> &arguments) {
 	function = GetMedianAbsoluteDeviationAggregateFunction(arguments[0]->return_type);
@@ -321,6 +328,8 @@ unique_ptr<FunctionData> BindMedianAbsoluteDeviationDecimal(ClientContext &conte
 	function.order_dependent = AggregateOrderDependent::NOT_ORDER_DEPENDENT;
 	return BindMAD(context, function, arguments);
 }
+
+} // namespace
 
 AggregateFunctionSet MadFun::GetFunctions() {
 	AggregateFunctionSet mad("mad");

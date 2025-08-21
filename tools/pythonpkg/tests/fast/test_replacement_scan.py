@@ -31,7 +31,7 @@ def fetch_df(rel):
 
 
 def fetch_arrow(rel):
-    return rel.arrow()
+    return rel.fetch_arrow_table()
 
 
 def fetch_arrow_table(rel):
@@ -318,7 +318,7 @@ class TestReplacementScan(object):
         """
         rel = create_relation(duckdb_cursor, query)
         res = rel.fetchall()
-        assert res == [(1,), (2,), (3,)]
+        assert res == [(2,), (3,), (4,)]
 
         query = """
             WITH RECURSIVE df AS (
@@ -328,7 +328,7 @@ class TestReplacementScan(object):
         """
         rel = create_relation(duckdb_cursor, query)
         res = rel.fetchall()
-        assert res == [(1,), (2,), (3,)]
+        assert res == [(2,), (3,), (4,)]
 
     def test_use_with_view(self, duckdb_cursor):
         rel = create_relation(duckdb_cursor, "select * from df")
